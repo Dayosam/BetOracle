@@ -47,4 +47,3 @@ def count_call():
         n = int(n[0]) + 1 if n else 1
         _db.execute("insert or replace into c values(?,?,?)", (day, str(n), time.time() + 172800)); _db.commit()
     return n
-py
