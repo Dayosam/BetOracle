@@ -1,13 +1,78 @@
-"""Run on your own computer after setting MBC_API_KEY:
-   python test_provider.py                                  -> checks the provider catalogue resolves your bookmakers (no credits used)
-   python test_provider.py CODE SOURCE TARGET               -> real conversion, e.g.  python test_provider.py 9ABC123 bet9ja sportybet
-A real conversion spends up to 4 provider credits and creates a real (non-staking) booking code."""
-import sys, json, bookmakers as bm, managebetcodes as mbc, convert_router as router
-print("Provider key set:", mbc.enabled())
-for k, v in bm.BOOKMAKERS.items():
-    print(f"  {v['label']:<14} route={bm.ROUTE[k]:<8} provider key={mbc.provider_key(k, v['label'])}")
-if len(sys.argv) == 4:
-    code, src, tgt = sys.argv[1:]
-    out = router.convert_for_chat(code, src, tgt)
-    out.pop("ticket", None)
-    print(json.dumps(out, indent=1, default=str))
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>BetOracle.ai</title>
+<link rel="icon" href="logo.svg">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:ital,wght@0,700;0,800;1,800&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#FFFFFF;--panel:#F4F6F9;--line:#E1E5EB;--ink:#0B1F3A;--mute:#667286;--violet:#0B1F3A;--gold:#E63A2E;--win:#1E8F5A}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--ink);font:16px/1.5 Inter,system-ui,sans-serif;display:flex;flex-direction:column}
+header{display:flex;align-items:center;gap:10px;padding:12px 16px;padding-top:calc(12px + env(safe-area-inset-top));border-bottom:1px solid var(--line)}
+header svg{width:38px;height:38px;filter:drop-shadow(0 2px 6px rgba(11,31,58,.2))}
+.wm{font-style:italic;font:italic 800 21px Archivo,system-ui,sans-serif;letter-spacing:-.02em}.wm i{font-style:normal;color:var(--gold)}
+main{flex:1;overflow-y:auto;width:100%;max-width:780px;margin:0 auto;padding:18px 16px;display:flex;flex-direction:column;gap:12px}
+.hero{margin:auto;text-align:center;padding:10px 0 20px}
+.hero svg{width:108px;height:108px;filter:drop-shadow(0 10px 28px rgba(11,31,58,.18))}
+.hero h2{font:800 28px Archivo,system-ui,sans-serif;margin:14px 0 4px;letter-spacing:-.02em}
+.hero p{color:var(--mute);margin:0 auto;max-width:340px}
+.sports{display:flex;gap:6px;overflow-x:auto;padding:0 16px 8px;max-width:780px;width:100%;margin:0 auto}
+.sports button,.act button{white-space:nowrap;background:var(--panel);border:1px solid var(--line);color:var(--ink);border-radius:99px;padding:7px 14px;font:inherit;font-size:14px;cursor:pointer}
+.sports button:hover,.act button:hover{border-color:var(--violet)}
+.m{max-width:86%;padding:10px 14px;border-radius:16px;white-space:pre-wrap}
+.u{align-self:flex-end;background:var(--violet);color:#fff;border-bottom-right-radius:4px}
+.a{align-self:flex-start;background:var(--panel);border:1px solid var(--line);border-bottom-left-radius:4px}
+.dots{color:var(--mute)}
+.slip{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--gold);border-radius:10px;padding:12px 14px}
+.slip h3{font:800 15px Archivo,system-ui,sans-serif;margin:0 0 6px}
+.pick{padding:9px 0;border-top:1px dashed var(--line)}.pick b{font-weight:500}
+.pick .o{float:right;color:var(--ink);font-weight:500;font-variant-numeric:tabular-nums}
+.pick p{margin:3px 0 0;color:var(--mute);font-size:14px}
+.tot{display:flex;justify-content:space-between;border-top:1px solid var(--ink);margin-top:4px;padding-top:8px;font-weight:500}
+.tot span:last-child{color:var(--win);font-variant-numeric:tabular-nums}
+.act{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.act .book{background:var(--gold);color:#fff;border-color:var(--gold);font-weight:500}
+.code{display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px}.code b{font:700 18px ui-monospace,Menlo,monospace;letter-spacing:.06em}.code span{color:var(--mute);font-size:14px}.code button{margin-left:auto;background:var(--ink);color:#fff;border:0;border-radius:8px;padding:6px 12px;font:inherit;font-size:14px;cursor:pointer}
+form{display:flex;gap:8px;width:100%;max-width:780px;margin:0 auto;padding:8px 16px calc(14px + env(safe-area-inset-bottom))}
+input{flex:1;min-width:0;padding:13px 15px;border-radius:12px;border:1px solid var(--line);background:var(--panel);color:var(--ink);font:inherit}
+form>button{background:var(--gold);color:#fff;border:0;border-radius:12px;padding:0 20px;font:inherit;font-weight:500;cursor:pointer}
+button:focus-visible,input:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+</style></head><body>
+<svg width="0" height="0" style="position:absolute"><defs>
+<symbol id="bo" viewBox="0 0 200 200"><circle cx="100" cy="100" r="96" fill="#fff"/><mask id="bocut" maskUnits="userSpaceOnUse" x="-60" y="-60" width="320" height="220"><rect x="-60" y="-60" width="320" height="220" fill="#fff"/><path d="M131-2L141 3L128 36L118 31Z" fill="#000"/></mask><g transform="translate(100 100) scale(.9) translate(-66 -50) skewX(-12)"><path d="M0 0H44C62 0 72 10 72 26C72 36 67 43 59 47C70 51 77 60 77 74C77 91 65 100 46 100H0ZM26 20V40H40C46 40 48 36 48 30C48 24 46 20 40 20ZM26 60V80H42C50 80 53 76 53 70C53 64 50 60 42 60Z" fill="#0B1F3A" fill-rule="evenodd"/><path d="M70 50a42 50 0 1 0 84 0a42 50 0 1 0-84 0ZM94 52a18 26 0 1 0 36 0a18 26 0 1 0-36 0Z" fill="#E63A2E" stroke="#fff" stroke-width="6" stroke-linejoin="round" paint-order="stroke" fill-rule="evenodd" mask="url(#bocut)"/></g></symbol></defs></svg>
+<header><svg aria-hidden="true"><use href="#bo"/></svg><div class="wm">BetOracle<i>.ai</i></div></header>
+<main id="log">
+ <div class="hero" id="hero"><svg aria-hidden="true"><use href="#bo"/></svg>
+  <h2>Your AI betting co-pilot.</h2><p>Predictions · Slip checks · Code conversion<br><small style="color:var(--mute)">MSport · Bet9ja · Paripesa · BetNaija · Afropari · Betway · 1xBet</small></p></div>
+</main>
+<form id="f"><input id="i" placeholder="Tell BetOracle what to do" autocomplete="off"><button>Send</button></form>
+<script>
+const log=document.getElementById('log'),inp=document.getElementById('i'),sid=Math.random().toString(36).slice(2);
+let slipEl=null,shown=0;
+function add(cls,t){const d=document.createElement('div');d.className='m '+cls;d.textContent=t;log.append(d);log.scrollTop=log.scrollHeight;return d}
+function slip(t){
+ if(slipEl)slipEl.remove();if(!t.length)return;
+ slipEl=document.createElement('div');slipEl.className='slip';
+ const h=document.createElement('h3');h.textContent='Your ticket';slipEl.append(h);
+ t.forEach(x=>{const p=document.createElement('div');p.className='pick';
+  const o=document.createElement('span');o.className='o';o.textContent=x.odds;
+  const b=document.createElement('b');b.textContent=`${x.home} v ${x.away}: ${x.market}, ${x.pick}`;
+  const r=document.createElement('p');r.textContent=x.reason;p.append(o,b,r);slipEl.append(p)});
+ const f=document.createElement('div');f.className='tot';f.innerHTML='<span>Total odds</span><span></span>';
+ f.lastChild.textContent=t.reduce((p,x)=>p*x.odds,1).toFixed(2);slipEl.append(f);
+ const a=document.createElement('div');a.className='act';
+ const bk=document.createElement('button');bk.className='book';bk.textContent='Book on SportyBet';bk.onclick=()=>send('Book this ticket on SportyBet');a.append(bk);
+ slipEl.append(a);log.append(slipEl);log.scrollTop=log.scrollHeight}
+function codes(list){
+ list.slice(shown).forEach(c=>{const d=document.createElement('div');d.className='code';
+  const b=document.createElement('b');b.textContent=c.code;const m=document.createElement('span');m.textContent=`${c.games} games, ${c.odds} odds`;
+  const k=document.createElement('button');k.textContent='Copy';k.onclick=()=>{navigator.clipboard?.writeText(c.code);k.textContent='Copied';setTimeout(()=>k.textContent='Copy',1500)};
+  d.append(b,m,k);log.append(d)});shown=list.length;log.scrollTop=log.scrollHeight}
+async function send(msg){
+ document.getElementById('hero')?.remove();
+ add('u',msg);const w=add('a dots','Thinking…');
+ try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session:sid,message:msg})});
+  const d=await r.json();w.className='m a';w.textContent=d.reply||'No reply. Check the server log.';codes(d.codes||[]);slip(d.ticket||[])}
+ catch(e){w.className='m a';w.textContent='Cannot reach the server. Start it with: uvicorn app:app --reload'}}
+document.getElementById('f').onsubmit=e=>{e.preventDefault();const v=inp.value.trim();if(v){inp.value='';send(v)}};
+</script></body></html>
