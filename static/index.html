@@ -22,6 +22,7 @@ main{flex:1;overflow-y:auto;width:100%;max-width:780px;margin:0 auto;padding:18p
 .m{max-width:86%;padding:10px 14px;border-radius:16px;white-space:pre-wrap}
 .u{align-self:flex-end;background:var(--violet);color:#fff;border-bottom-right-radius:4px}
 .a{align-self:flex-start;background:var(--panel);border:1px solid var(--line);border-bottom-left-radius:4px}
+.err{border-color:var(--gold);color:var(--gold)}
 .dots{color:var(--mute)}
 .slip{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--gold);border-radius:10px;padding:12px 14px}
 .slip h3{font:800 15px Archivo,system-ui,sans-serif;margin:0 0 6px}
@@ -36,6 +37,7 @@ main{flex:1;overflow-y:auto;width:100%;max-width:780px;margin:0 auto;padding:18p
 form{display:flex;gap:8px;width:100%;max-width:780px;margin:0 auto;padding:8px 16px calc(14px + env(safe-area-inset-bottom))}
 input{flex:1;min-width:0;padding:13px 15px;border-radius:12px;border:1px solid var(--line);background:var(--panel);color:var(--ink);font:inherit}
 form>button{background:var(--gold);color:#fff;border:0;border-radius:12px;padding:0 20px;font:inherit;font-weight:500;cursor:pointer}
+form>button:disabled{opacity:.5;cursor:not-allowed}
 button:focus-visible,input:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
 </style></head><body>
 <svg width="0" height="0" style="position:absolute"><defs>
@@ -45,11 +47,13 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--gold);outline-o
  <div class="hero" id="hero"><svg aria-hidden="true"><use href="#bo"/></svg>
   <h2>Your AI betting co-pilot.</h2><p>Predictions · Slip checks · Code conversion<br><small style="color:var(--mute)">MSport · Bet9ja · Paripesa · BetNaija · Afropari · Betway · 1xBet</small></p></div>
 </main>
-<form id="f"><input id="i" placeholder="Tell BetOracle what to do" autocomplete="off"><button>Send</button></form>
+<form id="f"><input id="i" placeholder="Tell BetOracle what to do" autocomplete="off"><button id="s">Send</button></form>
 <script>
-const log=document.getElementById('log'),inp=document.getElementById('i'),sid=Math.random().toString(36).slice(2);
-let slipEl=null,shown=0;
+const log=document.getElementById('log'),inp=document.getElementById('i'),btn=document.getElementById('s'),sid=Math.random().toString(36).slice(2);
+let slipEl=null,shown=0,busy=false;
+
 function add(cls,t){const d=document.createElement('div');d.className='m '+cls;d.textContent=t;log.append(d);log.scrollTop=log.scrollHeight;return d}
+
 function slip(t){
  if(slipEl)slipEl.remove();if(!t.length)return;
  slipEl=document.createElement('div');slipEl.className='slip';
@@ -63,17 +67,43 @@ function slip(t){
  const a=document.createElement('div');a.className='act';
  const bk=document.createElement('button');bk.className='book';bk.textContent='Book on SportyBet';bk.onclick=()=>send('Book this ticket on SportyBet');a.append(bk);
  slipEl.append(a);log.append(slipEl);log.scrollTop=log.scrollHeight}
+
 function codes(list){
  list.slice(shown).forEach(c=>{const d=document.createElement('div');d.className='code';
   const b=document.createElement('b');b.textContent=c.code;const m=document.createElement('span');m.textContent=`${c.games} games, ${c.odds} odds`;
   const k=document.createElement('button');k.textContent='Copy';k.onclick=()=>{navigator.clipboard?.writeText(c.code);k.textContent='Copied';setTimeout(()=>k.textContent='Copy',1500)};
   d.append(b,m,k);log.append(d)});shown=list.length;log.scrollTop=log.scrollHeight}
+
+function setBusy(v){busy=v;btn.disabled=v}
+
+function errText(r,d){
+ // FastAPI sends {detail: "..."}; Render's own gateway errors are HTML (no JSON)
+ let msg='';
+ if(d&&d.detail)msg=typeof d.detail==='string'?d.detail:JSON.stringify(d.detail);
+ if(!msg){
+  msg=(r.status===502||r.status===504)
+   ?'The server took too long or the gateway failed. Try a more specific request, e.g. "2 odds from Europa League tonight".'
+   :'Server error. Please try again.';
+ }
+ return `Error ${r.status}: ${msg}`}
+
 async function send(msg){
+ if(busy)return;
+ setBusy(true);
  document.getElementById('hero')?.remove();
  add('u',msg);const w=add('a dots','Thinking…');
- try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session:sid,message:msg})});
-  const d=await r.json();w.className='m a';w.textContent=d.reply||'No reply. Check the server log.';codes(d.codes||[]);slip(d.ticket||[])}
- catch(e){w.className='m a';w.textContent='Cannot reach the server. Start it with: uvicorn app:app --reload'}}
-document.getElementById('f').onsubmit=e=>{e.preventDefault();const v=inp.value.trim();if(v){inp.value='';send(v)}};
-</script></body></html>
+ try{
+  const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session:sid,message:msg})});
+  let d=null;
+  try{d=await r.json()}catch(_){d=null}
+  if(!r.ok){w.className='m a err';w.textContent=errText(r,d);return}
+  w.className='m a';
+  w.textContent=(d&&d.reply)||'The AI returned no text. Please try again.';
+  codes((d&&d.codes)||[]);slip((d&&d.ticket)||[])
+ }catch(e){
+  w.className='m a err';w.textContent='Cannot reach the server. Check your connection and try again.'
+ }finally{setBusy(false)}
+}
 
+document.getElementById('f').onsubmit=e=>{e.preventDefault();const v=inp.value.trim();if(v&&!busy){inp.value='';send(v)}};
+</script></body></html>
