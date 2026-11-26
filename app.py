@@ -7,7 +7,7 @@ import threading
 import traceback
 import httpx
 
-from datetime import date, timedelta
+from datetime import date
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -21,7 +21,7 @@ import msport
 import convert_router as router
 import prediction_engine
 
-from cache import cached, count_call
+from cache import count_call
 
 
 # =========================================================
@@ -35,16 +35,31 @@ MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-MAX_STEPS = int(os.getenv("AI_MAX_STEPS", "12"))
-MAX_HISTORY = int(os.getenv("AI_HISTORY_LIMIT", "12"))
-TOOL_RESULT_LIMIT = int(os.getenv("AI_TOOL_RESULT_LIMIT", "2500"))
+# Faster defaults
+MAX_STEPS = int(os.getenv("AI_MAX_STEPS", "5"))
+MAX_HISTORY = int(os.getenv("AI_HISTORY_LIMIT", "10"))
+TOOL_RESULT_LIMIT = int(os.getenv("AI_TOOL_RESULT_LIMIT", "1800"))
 
-TPM_LIMIT = int(os.getenv("GROQ_TPM_LIMIT", "7200"))
-MAX_OUT = int(os.getenv("GROQ_MAX_OUT", "1200"))
+MAX_OUT = int(os.getenv("GROQ_MAX_OUT", "700"))
+
+GROQ_TIMEOUT = float(os.getenv("GROQ_TIMEOUT_SECONDS", "20"))
+GROQ_RETRIES = int(os.getenv("GROQ_RETRIES", "1"))
 
 PLATFORMS = list(bookmakers.BOOKMAKERS)
 
 SESSIONS = {}
+
+# Prevent two simultaneous requests from modifying one session.
+SESSION_LOCKS = {}
+SESSION_LOCKS_GUARD = threading.Lock()
+
+
+def get_session_lock(session_id):
+    with SESSION_LOCKS_GUARD:
+        if session_id not in SESSION_LOCKS:
+            SESSION_LOCKS[session_id] = threading.Lock()
+
+        return SESSION_LOCKS[session_id]
 
 
 # =========================================================
@@ -55,7 +70,6 @@ def detect_prediction_request(message):
 
     text = message.lower().strip()
 
-    # Requests that must remain in normal chat.
     excluded = [
         "why did you choose",
         "why did you select",
@@ -86,17 +100,14 @@ def detect_prediction_request(message):
     ]
 
     for pattern in patterns:
-
         match = re.search(pattern, text)
 
         if match:
-
             return {
                 "count": min(int(match.group(1)), 20),
                 "league": None
             }
 
-    # Requests without a specified number.
     general_requests = [
         "give me predictions",
         "best predictions",
@@ -108,7 +119,6 @@ def detect_prediction_request(message):
     ]
 
     if any(term in text for term in general_requests):
-
         return {
             "count": 2,
             "league": None
@@ -643,6 +653,7 @@ def run_tool(name, a, s):
                 if i in idx
                 or (
                     rng
+                    and len(rng) >= 2
                     and rng[0] <= x["odds"] <= rng[1]
                 )
             ]
@@ -652,6 +663,7 @@ def run_tool(name, a, s):
                 if i not in idx
                 and not (
                     rng
+                    and len(rng) >= 2
                     and rng[0] <= x["odds"] <= rng[1]
                 )
             ]
@@ -666,7 +678,10 @@ def run_tool(name, a, s):
 
         if name == "split_ticket":
 
-            n = max(2, int(a["parts"]))
+            if not t:
+                return {"error": "The ticket is empty."}
+
+            n = max(2, min(int(a["parts"]), len(t)))
             cap = math.ceil(len(t) / n)
 
             groups = [[] for _ in range(n)]
@@ -731,6 +746,9 @@ def run_tool(name, a, s):
 
         if name == "convert_ticket" and a["platform"] == "msport":
 
+            if not t:
+                return {"error": "The ticket is empty."}
+
             r = msport.create_msport_code(t)
 
             item = {
@@ -775,73 +793,8 @@ def run_tool(name, a, s):
 
 
 # =========================================================
-# GROQ API REQUEST
+# GROQ API REQUEST — FAST VERSION
 # =========================================================
-
-_usage = []
-_usage_lock = threading.Lock()
-
-
-def _wait_for_budget(needed):
-
-    waited = 0.0
-
-    while waited < 70:
-
-        now = time.time()
-
-        with _usage_lock:
-
-            _usage[:] = [
-                (t, n)
-                for t, n in _usage
-                if now - t < 60
-            ]
-
-            used = sum(
-                n for _, n in _usage
-            )
-
-            if not _usage or used + needed <= TPM_LIMIT:
-                return
-
-            pause = (
-                60 - (now - _usage[0][0]) + 0.5
-            )
-
-        pause = min(
-            max(pause, 1.0),
-            15.0
-        )
-
-        time.sleep(pause)
-        waited += pause
-
-
-def _record_usage(tokens):
-
-    with _usage_lock:
-        _usage.append(
-            (time.time(), int(tokens))
-        )
-
-
-def _retry_seconds(text, default=5.0):
-
-    match = re.search(
-        r"try again in (?:(\d+)m)?([\d.]+)s",
-        text or ""
-    )
-
-    if not match:
-        return default
-
-    return (
-        int(match.group(1) or 0) * 60
-        + float(match.group(2))
-        + 0.5
-    )
-
 
 def groq_request(messages, use_tools=True):
 
@@ -872,16 +825,9 @@ def groq_request(messages, use_tools=True):
         "Content-Type": "application/json"
     }
 
-    estimate = (
-        len(json.dumps(payload, default=str)) // 3
-        + MAX_OUT
-    )
-
     last_error = ""
 
-    for attempt in range(6):
-
-        _wait_for_budget(estimate)
+    for attempt in range(GROQ_RETRIES + 1):
 
         try:
 
@@ -889,31 +835,48 @@ def groq_request(messages, use_tools=True):
                 GROQ_URL,
                 headers=headers,
                 json=payload,
-                timeout=90
+                timeout=httpx.Timeout(
+                    GROQ_TIMEOUT,
+                    connect=5
+                )
             )
 
         except httpx.TimeoutException:
 
-            last_error = "Groq request timed out."
-            continue
+            last_error = (
+                f"Groq timed out after {GROQ_TIMEOUT} seconds."
+            )
+
+            if attempt < GROQ_RETRIES:
+                time.sleep(1)
+                continue
+
+            break
 
         except httpx.RequestError as e:
 
             last_error = f"Groq connection error: {e}"
-            continue
+
+            if attempt < GROQ_RETRIES:
+                time.sleep(1)
+                continue
+
+            break
 
         if response.status_code == 429:
 
             last_error = (
-                f"Groq rate limit: {response.text[:300]}"
+                "Groq rate limit reached. "
+                "Wait briefly and try again. "
+                + response.text[:300]
             )
 
-            wait = _retry_seconds(response.text)
+            # Do not wait 25 seconds or retry repeatedly.
+            if attempt < GROQ_RETRIES:
+                time.sleep(2)
+                continue
 
-            _record_usage(TPM_LIMIT // 2)
-
-            time.sleep(min(wait, 25))
-            continue
+            break
 
         if (
             response.status_code == 400
@@ -924,7 +887,11 @@ def groq_request(messages, use_tools=True):
                 f"Groq tool_use_failed: {response.text[:300]}"
             )
 
-            continue
+            if attempt < GROQ_RETRIES:
+                time.sleep(1)
+                continue
+
+            break
 
         if response.status_code >= 400:
 
@@ -933,25 +900,24 @@ def groq_request(messages, use_tools=True):
                 f"{response.text[:800]}"
             )
 
-        data = response.json()
-
-        used = (
-            data.get("usage") or {}
-        ).get("total_tokens")
-
-        _record_usage(
-            used if used else estimate
-        )
+        try:
+            data = response.json()
+        except ValueError:
+            raise RuntimeError("Groq returned invalid JSON.")
 
         if not data.get("choices"):
 
             last_error = "Groq returned an empty response."
-            continue
+
+            if attempt < GROQ_RETRIES:
+                continue
+
+            break
 
         return data["choices"][0]["message"]
 
     raise RuntimeError(
-        last_error or "Groq failed after retries."
+        last_error or "Groq request failed."
     )
 
 
@@ -975,6 +941,8 @@ app = FastAPI()
 @app.get("/api/test-groq")
 def test_groq():
 
+    started = time.time()
+
     try:
 
         result = groq_request(
@@ -990,7 +958,8 @@ def test_groq():
         return {
             "success": True,
             "model": MODEL,
-            "reply": result.get("content")
+            "reply": result.get("content"),
+            "elapsed_seconds": round(time.time() - started, 2)
         }
 
     except Exception as e:
@@ -998,7 +967,8 @@ def test_groq():
         return {
             "success": False,
             "model": MODEL,
-            "error": str(e)
+            "error": str(e),
+            "elapsed_seconds": round(time.time() - started, 2)
         }
 
 
@@ -1009,48 +979,83 @@ def test_groq():
 @app.post("/api/chat")
 def chat(c: Chat):
 
-    s = SESSIONS.setdefault(
-        c.session,
-        {
-            "history": [],
-            "ticket": [],
-            "slips": [],
-            "codes": []
-        }
-    )
+    started = time.time()
 
-    msgs = s["history"]
-    previous_length = len(msgs)
+    session_id = c.session.strip()
+    message = c.message.strip()
+
+    if not session_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Session ID is required."
+        )
+
+    if not message:
+        raise HTTPException(
+            status_code=400,
+            detail="Message cannot be empty."
+        )
+
+    lock = get_session_lock(session_id)
+
+    # Do not allow overlapping requests in the same session.
+    if not lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="A request is already processing. Please wait."
+        )
 
     try:
+
+        s = SESSIONS.setdefault(
+            session_id,
+            {
+                "history": [],
+                "ticket": [],
+                "slips": [],
+                "codes": []
+            }
+        )
+
+        msgs = s["history"]
+        previous_length = len(msgs)
 
         # -------------------------------------------------
         # 1. CHECK WHETHER THIS IS A PREDICTION REQUEST
         # -------------------------------------------------
 
-        prediction_request = detect_prediction_request(
-            c.message
-        )
+        prediction_request = detect_prediction_request(message)
 
         if prediction_request:
 
-            result = prediction_engine.predict(
-                sportapi_module=sportapi,
-                sportybet_module=sportybet,
-                count=prediction_request["count"],
-                league=prediction_request["league"]
-            )
+            try:
 
-            # Predictions are returned separately.
-            # They are NOT automatically added to the ticket.
-            # No booking code is generated here.
+                result = prediction_engine.predict(
+                    sportapi_module=sportapi,
+                    sportybet_module=sportybet,
+                    count=prediction_request["count"],
+                    league=prediction_request["league"]
+                )
+
+            except Exception as e:
+
+                traceback.print_exc()
+
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Prediction engine error: {str(e)}"
+                )
 
             return {
-                "reply": result["reply"],
+                "reply": result.get(
+                    "reply",
+                    "I couldn't find suitable predictions."
+                ),
                 "ticket": s["ticket"],
                 "codes": s["codes"],
-                "predictions": result["ticket"],
-                "booking_created": False
+                "predictions": result.get("ticket", []),
+                "booking_created": False,
+                "elapsed_seconds": round(time.time() - started, 2)
             }
 
         # -------------------------------------------------
@@ -1059,7 +1064,7 @@ def chat(c: Chat):
 
         msgs.append({
             "role": "user",
-            "content": c.message
+            "content": message
         })
 
         reply = ""
@@ -1083,7 +1088,6 @@ def chat(c: Chat):
             tool_calls = r.get("tool_calls") or []
 
             if tool_calls:
-
                 assistant_message["tool_calls"] = tool_calls
 
             msgs.append(assistant_message)
@@ -1099,7 +1103,6 @@ def chat(c: Chat):
             for call in tool_calls:
 
                 function = call.get("function", {})
-
                 tool_name = function.get("name")
 
                 raw_args = (
@@ -1109,11 +1112,8 @@ def chat(c: Chat):
                 try:
 
                     if isinstance(raw_args, str):
-
                         arguments = json.loads(raw_args)
-
                     else:
-
                         arguments = raw_args
 
                     if not isinstance(arguments, dict):
@@ -1138,7 +1138,7 @@ def chat(c: Chat):
                 })
 
         # -------------------------------------------------
-        # 3. FORCE A FINAL TEXT RESPONSE IF NECESSARY
+        # 3. FINAL TEXT RESPONSE IF NECESSARY
         # -------------------------------------------------
 
         if not reply:
@@ -1183,8 +1183,12 @@ def chat(c: Chat):
         return {
             "reply": reply,
             "ticket": s["ticket"],
-            "codes": s["codes"]
+            "codes": s["codes"],
+            "elapsed_seconds": round(time.time() - started, 2)
         }
+
+    except HTTPException:
+        raise
 
     except Exception as e:
 
@@ -1192,12 +1196,18 @@ def chat(c: Chat):
 
         print("CHAT ERROR:", e)
 
-        del msgs[previous_length:]
+        # Remove the incomplete conversation from history.
+        if "msgs" in locals():
+            del msgs[previous_length:]
 
         raise HTTPException(
             status_code=502,
             detail=str(e)
         )
+
+    finally:
+
+        lock.release()
 
 
 # =========================================================
@@ -1241,7 +1251,10 @@ def health():
         "model": MODEL,
         "chat_engine": "Groq",
         "prediction_engine": "Python",
-        "api_key_configured": bool(GROQ_API_KEY)
+        "api_key_configured": bool(GROQ_API_KEY),
+        "groq_timeout_seconds": GROQ_TIMEOUT,
+        "groq_retries": GROQ_RETRIES,
+        "max_tool_steps": MAX_STEPS
     }
 
 
@@ -1249,16 +1262,20 @@ def health():
 # FRONTEND
 # =========================================================
 
-app.mount(
-    "/",
-    StaticFiles(
-        directory=os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "static"
-        ),
-        html=True
-    )
+STATIC_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "static"
 )
+
+if os.path.isdir(STATIC_DIR):
+
+    app.mount(
+        "/",
+        StaticFiles(
+            directory=STATIC_DIR,
+            html=True
+        )
+    )
 
 
 # =========================================================
