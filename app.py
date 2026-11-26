@@ -6,6 +6,7 @@ import time
 import threading
 import traceback
 import httpx
+import concurrent.futures
 
 from datetime import date
 from dotenv import load_dotenv
@@ -1071,7 +1072,9 @@ def chat(c: Chat):
 
     lock = get_session_lock(session_id)
 
-    if not lock.acquire(blocking=False):
+    # FIX 1: Add a timeout so the lock cannot get stuck forever.
+    # It will wait up to 60 seconds for the previous request to finish.
+    if not lock.acquire(timeout=60):
 
         raise HTTPException(
             status_code=409,
@@ -1099,13 +1102,19 @@ def chat(c: Chat):
         if prediction_request:
 
             try:
-
-                result = prediction_engine.predict(
-                    sportapi_module=sportapi,
-                    sportybet_module=sportybet,
-                    count=prediction_request["count"],
-                    league=prediction_request["league"]
-                )
+                # FIX 2: Run the prediction engine in a separate thread
+                # with a hard 50-second timeout. If your external API
+                # (SportyBet/SportAPI) hangs, this stops the entire
+                # server from locking up.
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        prediction_engine.predict,
+                        sportapi_module=sportapi,
+                        sportybet_module=sportybet,
+                        count=prediction_request["count"],
+                        league=prediction_request["league"]
+                    )
+                    result = future.result(timeout=50)
 
                 if not isinstance(result, dict):
 
@@ -1113,6 +1122,11 @@ def chat(c: Chat):
                         "Prediction engine returned an invalid response."
                     )
 
+            except concurrent.futures.TimeoutError:
+                raise HTTPException(
+                    status_code=504,
+                    detail="The prediction engine took too long to respond. Please try again."
+                )
             except Exception as e:
 
                 traceback.print_exc()
