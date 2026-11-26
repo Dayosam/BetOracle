@@ -21,6 +21,7 @@ Features:
 
 import re
 import math
+import time
 from datetime import date, timedelta
 
 
@@ -189,27 +190,6 @@ def _as_list(value):
 # ============================================================
 
 def _stats_quality(stats):
-    """
-    Inspect nested SportAPI statistics.
-
-    SportAPI returns statistics in this structure:
-
-        {
-            "home": {
-                "last5_overall": [],
-                "last5_at_home": []
-            },
-            "away": {
-                "last5_overall": [],
-                "last5_away": []
-            },
-            "h2h": []
-        }
-
-    This function checks the nested information rather than
-    looking only at the top-level dictionary keys.
-    """
-
     if not isinstance(stats, dict):
         return 0, []
 
@@ -225,29 +205,24 @@ def _stats_quality(stats):
     if not isinstance(away, dict):
         away = {}
 
-    # Overall recent form.
     home_form = home.get("last5_overall", [])
     away_form = away.get("last5_overall", [])
 
     if home_form or away_form:
         evidence.append("recent form")
 
-    # Home team's home form.
     if home.get("last5_at_home"):
         evidence.append("home form")
 
-    # Away team's away form.
     if away.get("last5_away"):
         evidence.append("away form")
 
-    # League table.
     if (
         home.get("position") is not None
         and away.get("position") is not None
     ):
         evidence.append("league table")
 
-    # Head-to-head.
     if isinstance(h2h, list) and h2h:
         evidence.append("head-to-head")
 
@@ -259,10 +234,6 @@ def _stats_quality(stats):
 # ============================================================
 
 def _stats_summary(stats):
-    """
-    Create a readable summary of nested SportAPI statistics.
-    """
-
     if not isinstance(stats, dict):
         return "No usable statistics were returned."
 
@@ -289,7 +260,6 @@ def _stats_summary(stats):
 
         parts.append(f"{title}: {text}")
 
-    # Home team information.
     home_table = {
         "team": home.get("team"),
         "position": home.get("position"),
@@ -319,7 +289,6 @@ def _stats_summary(stats):
         home.get("last5_at_home")
     )
 
-    # Away team information.
     away_table = {
         "team": away.get("team"),
         "position": away.get("position"),
@@ -349,7 +318,6 @@ def _stats_summary(stats):
         away.get("last5_away")
     )
 
-    # Head-to-head.
     add_section("Head-to-head", h2h)
 
     if not parts:
@@ -427,11 +395,6 @@ def _market_reference(market):
 
 
 def _market_candidates(rows):
-    """
-    Accept recognised goal markets with valid odds
-    and a selection reference.
-    """
-
     accepted = []
 
     for market in rows:
@@ -503,18 +466,10 @@ def predict(
     date_to=None,
     league=None,
     min_odds=1.15,
-    max_candidates=80
+    max_candidates=20  # FIX: Reduced from 80 to 20 to prevent timeouts
 ):
     """
     Generate evidence-screened football predictions.
-
-    This function:
-        - Does not call Groq.
-        - Does not create booking codes.
-        - Retrieves fixtures from SportAPI.
-        - Checks available statistics.
-        - Retrieves SportyBet markets.
-        - Returns only selections that pass the checks.
     """
 
     count = max(1, min(int(count), 20))
@@ -524,6 +479,12 @@ def predict(
     date_to = date_to or (
         date.today() + timedelta(days=1)
     ).isoformat()
+
+    # --------------------------------------------------------
+    # 0. START TIMER (FIX: Hard stop at 45 seconds)
+    # --------------------------------------------------------
+    start_time = time.time()
+    TIME_LIMIT = 45.0
 
     # --------------------------------------------------------
     # 1. FETCH FIXTURES
@@ -575,7 +536,6 @@ def predict(
             league_id
         ))
 
-    # Analyse more fixtures instead of stopping at 12.
     candidates = candidates[:max_candidates]
 
     # --------------------------------------------------------
@@ -603,9 +563,13 @@ def predict(
         league_id
     ) in candidates:
 
+        # FIX: Check the clock. If we are out of time, stop looping.
+        if time.time() - start_time > TIME_LIMIT:
+            errors.append("Time limit reached. Returning partial results.")
+            break
+
         try:
 
-            # Fetch team and match statistics.
             stats = sportapi_module.stats(
                 "football",
                 home_id,
@@ -619,12 +583,10 @@ def predict(
                 _stats_quality(stats)
             )
 
-            # Reject matches without enough evidence.
             if evidence_score < 2:
                 stats_rejected += 1
                 continue
 
-            # Require recent form.
             if not any(
                 "form" in item
                 for item in evidence_labels
@@ -633,10 +595,6 @@ def predict(
                 continue
 
             evidence = _stats_summary(stats)
-
-            # ------------------------------------------------
-            # 4. RETRIEVE SPORTYBET MARKETS
-            # ------------------------------------------------
 
             markets_raw = sportybet_module.get_markets(
                 "football",
@@ -654,10 +612,6 @@ def predict(
                 markets_rejected += 1
                 continue
 
-            # ------------------------------------------------
-            # 5. CHECK EACH MARKET
-            # ------------------------------------------------
-
             for market in markets:
 
                 odds = _market_odds(market)
@@ -667,8 +621,6 @@ def predict(
 
                 text = _market_text(market)
 
-                # Evidence coverage ranking.
-                # This is NOT a calculated win probability.
                 specificity = (
                     1
                     if (
@@ -728,7 +680,7 @@ def predict(
             )
 
     # --------------------------------------------------------
-    # 6. REMOVE DUPLICATE SELECTIONS
+    # 4. REMOVE DUPLICATE SELECTIONS
     # --------------------------------------------------------
 
     unique = {}
@@ -751,7 +703,7 @@ def predict(
     ranked = list(unique.values())
 
     # --------------------------------------------------------
-    # 7. RANK QUALIFYING SELECTIONS
+    # 5. RANK QUALIFYING SELECTIONS
     # --------------------------------------------------------
 
     ranked.sort(
@@ -764,12 +716,11 @@ def predict(
 
     selected = ranked[:count]
 
-    # Remove internal ranking score.
     for pick in selected:
         pick.pop("_score", None)
 
     # --------------------------------------------------------
-    # 8. GENERATE RESPONSE
+    # 6. GENERATE RESPONSE
     # --------------------------------------------------------
 
     if not selected:
@@ -808,7 +759,7 @@ def predict(
         reply = "\n\n".join(lines)
 
     # --------------------------------------------------------
-    # 9. RETURN RESULTS AND DIAGNOSTICS
+    # 7. RETURN RESULTS AND DIAGNOSTICS
     # --------------------------------------------------------
 
     return {
