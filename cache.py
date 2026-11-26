@@ -6,6 +6,7 @@ URL = os.getenv("UPSTASH_REDIS_REST_URL")
 TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 MAX_BYTES = 900_000  # skip caching anything bigger than Upstash's request limit
 _lock = threading.Lock()
+
 if not URL:
     _db = sqlite3.connect(os.getenv("CACHE_DB", "cache.db"), check_same_thread=False)
     _db.execute("create table if not exists c(k text primary key, v text, exp real)")
@@ -17,23 +18,48 @@ def _redis(*cmd):
 
 def cached(key, ttl, fn):
     """Return a stored result if still fresh, otherwise call fn() once and store it. Errors are never stored."""
+    
+    # --- FIX: Do not cache empty/failed results ---
+    def _is_cacheable(val):
+        if val is None: return False
+        if isinstance(val, (list, dict)) and len(val) == 0: return False
+        if isinstance(val, str) and not val.strip(): return False
+        return True
+
     if URL:
         try:
             v = _redis("GET", key)
-            if v is not None: return json.loads(v)
-        except Exception: pass
+            if v is not None: 
+                return json.loads(v)
+        except Exception: 
+            pass
+        
         val = fn()
-        try:
-            s = json.dumps(val, default=str)
-            if len(s) < MAX_BYTES: _redis("SET", key, s, "EX", int(ttl))
-        except Exception: pass
+        
+        # --- Only save if the response actually contains data ---
+        if _is_cacheable(val):
+            try:
+                s = json.dumps(val, default=str)
+                if len(s) < MAX_BYTES: 
+                    _redis("SET", key, s, "EX", int(ttl))
+            except Exception: 
+                pass
+                
         return val
+
     with _lock:
         row = _db.execute("select v from c where k=? and exp>?", (key, time.time())).fetchone()
-    if row: return json.loads(row[0])
+    if row: 
+        return json.loads(row[0])
+        
     val = fn()
-    with _lock:
-        _db.execute("insert or replace into c values(?,?,?)", (key, json.dumps(val, default=str), time.time() + ttl)); _db.commit()
+    
+    # --- Only save if the response actually contains data ---
+    if _is_cacheable(val):
+        with _lock:
+            _db.execute("insert or replace into c values(?,?,?)", (key, json.dumps(val, default=str), time.time() + ttl))
+            _db.commit()
+            
     return val
 
 def count_call():
@@ -45,5 +71,6 @@ def count_call():
     with _lock:
         n = _db.execute("select v from c where k=?", (day,)).fetchone()
         n = int(n[0]) + 1 if n else 1
-        _db.execute("insert or replace into c values(?,?,?)", (day, str(n), time.time() + 172800)); _db.commit()
+        _db.execute("insert or replace into c values(?,?,?)", (day, str(n), time.time() + 172800))
+        _db.commit()
     return n
