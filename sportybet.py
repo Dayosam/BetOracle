@@ -7,7 +7,7 @@ from cache import cached
 
 BASE = "https://www.sportybet.com/api/ng"
 HEAD = {"accept": "application/json", "content-type": "application/json", "current-country": "NG",
-        "user-agent": "Mozilla/5.0 (compatible; BetOracle/1.0)"}
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 SPORTS = {"football": "sr:sport:1", "basketball": "sr:sport:2", "baseball": "sr:sport:3", "ice hockey": "sr:sport:4", "tennis": "sr:sport:5",
           "handball": "sr:sport:6", "rugby": "sr:sport:12", "snooker": "sr:sport:19", "table tennis": "sr:sport:20",
           "cricket": "sr:sport:21", "darts": "sr:sport:22", "volleyball": "sr:sport:23"}
@@ -18,13 +18,37 @@ def _get(path, params=None, ttl=300):
     def call():
         for wait in (0, 6, 20):
             time.sleep(wait)
-            r = httpx.get(BASE + path, params=params, headers=HEAD, timeout=25)
-            if r.status_code == 429 or (r.status_code == 200 and r.json().get("bizCode") == 19411): continue
-            r.raise_for_status()
-            j = r.json()
-            if j.get("bizCode") != 10000: raise RuntimeError(f"SportyBet answered {j.get('bizCode')}: {j.get('message')}")
+            try:
+                r = httpx.get(BASE + path, params=params, headers=HEAD, timeout=15)
+            except httpx.RequestError as e:
+                print(f"SPORTYBET NETWORK ERROR: {e}")
+                continue
+                
+            if r.status_code == 429:
+                print("SPORTYBET RATE LIMIT (429)")
+                continue
+                
+            if r.status_code != 200:
+                print(f"SPORTYBET ERROR: HTTP {r.status_code} - {r.text[:200]}")
+                continue
+
+            try:
+                j = r.json()
+            except Exception:
+                print(f"SPORTYBET ERROR: Invalid JSON. Response text: {r.text[:500]}")
+                continue
+
+            if j.get("bizCode") == 19411:
+                print("SPORTYBET BIZCODE 19411 (Rate Limit)")
+                continue
+                
+            if j.get("bizCode") != 10000: 
+                print(f"SPORTYBET BIZCODE ERROR: {j.get('bizCode')} - {j.get('message')}")
+                raise RuntimeError(f"SportyBet answered {j.get('bizCode')}: {j.get('message')}")
+                
             return j["data"]
-        raise RuntimeError("SportyBet is rate limiting this server. Wait a few minutes and retry.")
+            
+        raise RuntimeError("SportyBet is rate limiting or blocking this server. Wait a few minutes and retry.")
     return cached("sb:" + path + repr(sorted((params or {}).items())), ttl, call)
 
 def _events(sport):
