@@ -1,6 +1,8 @@
 import os
 import json
 import math
+import time
+import traceback
 import httpx
 
 from datetime import date
@@ -31,7 +33,8 @@ MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 MAX_STEPS = int(os.getenv("AI_MAX_STEPS", "12"))
-MAX_HISTORY = int(os.getenv("AI_HISTORY_LIMIT", "30"))
+MAX_HISTORY = int(os.getenv("AI_HISTORY_LIMIT", "20"))
+TOOL_RESULT_LIMIT = int(os.getenv("AI_TOOL_RESULT_LIMIT", "3500"))
 
 PLATFORMS = list(bookmakers.BOOKMAKERS)
 
@@ -52,6 +55,13 @@ Follow the user's instructions exactly.
 
 For example, "book me weekend matches" means:
 get_fixtures for Saturday and Sunday, get_markets and get_stats, add_to_ticket, then book_ticket.
+
+If the user does not name a match, do not keep asking questions.
+Look at upcoming fixtures with get_fixtures, choose the best-supported matches yourself,
+and go ahead. If the user names a league (for example "Europa League"), use it as the league filter.
+
+Be efficient with tools: for a small request such as "2 best odds", look at no more than
+4 candidate matches, then pick 2. Do not call tools you do not need.
 
 RULES:
 
@@ -125,6 +135,8 @@ If any leg is suspended, not listed or missing from the created code, say exactl
 Only say a code was created if a tool returned it.
 
 If a tool fails, tell the user plainly what is missing.
+
+ALWAYS finish with a written reply to the user. Never end your turn with only tool calls.
 """
 
 
@@ -359,6 +371,31 @@ def prod(legs):
 
 
 # =========================================================
+# CHAT HELPERS
+# =========================================================
+
+def compact(result, limit=TOOL_RESULT_LIMIT):
+    """Serialise a tool result and cap its size to save tokens."""
+
+    text = json.dumps(result, default=str, separators=(",", ":"))
+
+    if len(text) > limit:
+        text = text[:limit] + '..."[truncated]"'
+
+    return text
+
+
+def trim_history(msgs):
+    """Keep history short, and never start it with a tool/assistant fragment."""
+
+    if len(msgs) > MAX_HISTORY:
+        del msgs[:-MAX_HISTORY]
+
+    while msgs and msgs[0]["role"] != "user":
+        del msgs[0]
+
+
+# =========================================================
 # TOOL EXECUTION
 # =========================================================
 
@@ -536,7 +573,7 @@ def run_tool(name, a, s):
             return {
                 "removed": len(gone),
                 "ticket_size": len(t),
-                "total_odds": prod(t)
+                "total_odds": prod(t) if t else 0
             }
 
         if name == "split_ticket":
@@ -569,7 +606,7 @@ def run_tool(name, a, s):
                 {
                     "slip": i + 1,
                     "games": len(g),
-                    "odds": prod(g)
+                    "odds": prod(g) if g else 0
                 }
                 for i, g in enumerate(groups)
             ]
@@ -596,6 +633,9 @@ def run_tool(name, a, s):
 
                 out.append(item)
                 s["codes"].append(item)
+
+            if not out:
+                return {"error": "The ticket is empty. Add selections first."}
 
             return out
 
@@ -643,7 +683,7 @@ def run_tool(name, a, s):
 
 
 # =========================================================
-# GROQ API REQUEST
+# GROQ API REQUEST (with retries)
 # =========================================================
 
 def groq_request(messages, use_tools=True):
@@ -670,44 +710,60 @@ def groq_request(messages, use_tools=True):
         "Content-Type": "application/json"
     }
 
-    try:
+    last_error = ""
 
-        response = httpx.post(
-            GROQ_URL,
-            headers=headers,
-            json=payload,
-            timeout=90
-        )
-
-    except httpx.TimeoutException:
-        raise RuntimeError(
-            "Groq request timed out. Please try again."
-        )
-
-    except httpx.RequestError as e:
-        raise RuntimeError(
-            f"Groq connection error: {e}"
-        )
-
-    if response.status_code >= 400:
+    for attempt in range(4):
 
         try:
-            error_data = response.json()
-        except Exception:
-            error_data = response.text[:1000]
 
-        raise RuntimeError(
-            f"Groq HTTP {response.status_code}: {error_data}"
-        )
+            response = httpx.post(
+                GROQ_URL,
+                headers=headers,
+                json=payload,
+                timeout=90
+            )
 
-    data = response.json()
+        except httpx.TimeoutException:
+            last_error = "Groq request timed out."
+            continue
 
-    if not data.get("choices"):
-        raise RuntimeError(
-            "Groq returned an empty response."
-        )
+        except httpx.RequestError as e:
+            last_error = f"Groq connection error: {e}"
+            continue
 
-    return data["choices"][0]["message"]
+        # Rate limited: wait, then retry
+        if response.status_code == 429:
+
+            try:
+                wait = float(response.headers.get("retry-after", 5))
+            except ValueError:
+                wait = 5
+
+            last_error = f"Groq rate limit: {response.text[:300]}"
+            time.sleep(min(wait, 20))
+            continue
+
+        # Model produced a malformed tool call: retry
+        if response.status_code == 400 and "tool_use_failed" in response.text:
+
+            last_error = f"Groq tool_use_failed: {response.text[:300]}"
+            continue
+
+        if response.status_code >= 400:
+
+            raise RuntimeError(
+                f"Groq HTTP {response.status_code}: {response.text[:800]}"
+            )
+
+        data = response.json()
+
+        if not data.get("choices"):
+            last_error = "Groq returned an empty response."
+            continue
+
+        return data["choices"][0]["message"]
+
+    raise RuntimeError(last_error or "Groq failed after retries.")
 
 
 # =========================================================
@@ -789,18 +845,12 @@ def chat(c: Chat):
         for step in range(MAX_STEPS):
 
             r = groq_request(
-                [
-                    {
-                        "role": "system",
-                        "content": SYSTEM
-                    }
-                ] + msgs,
-                use_tools=True
+                [{"role": "system", "content": SYSTEM}] + msgs
             )
 
             assistant_message = {
                 "role": "assistant",
-                "content": r.get("content")
+                "content": r.get("content") or ""
             }
 
             tool_calls = r.get("tool_calls") or []
@@ -812,7 +862,7 @@ def chat(c: Chat):
 
             if not tool_calls:
 
-                reply = r.get("content") or ""
+                reply = (r.get("content") or "").strip()
                 break
 
             for call in tool_calls:
@@ -821,7 +871,7 @@ def chat(c: Chat):
 
                 tool_name = function.get("name")
 
-                raw_args = function.get("arguments", "{}")
+                raw_args = function.get("arguments") or "{}"
 
                 try:
 
@@ -848,21 +898,42 @@ def chat(c: Chat):
                 msgs.append({
                     "role": "tool",
                     "tool_call_id": call["id"],
-                    "content": json.dumps(
-                        result,
-                        default=str
-                    )[:12000]
+                    "content": compact(result)
                 })
 
-        else:
+        # The model returned no text, or ran out of steps:
+        # force a plain-text answer with no tools.
+        if not reply:
 
-            reply = (
-                "I reached the maximum number of analysis steps. "
-                "Please narrow down your request."
+            msgs.append({
+                "role": "user",
+                "content": (
+                    "Now reply to me in plain text. Start with the "
+                    "booking code if one exists, then list the picks "
+                    "with odds and the stats reason for each. "
+                    "If something failed, say exactly what."
+                )
+            })
+
+            final = groq_request(
+                [{"role": "system", "content": SYSTEM}] + msgs,
+                use_tools=False
             )
 
-        if len(msgs) > MAX_HISTORY:
-            del msgs[:-MAX_HISTORY]
+            reply = (final.get("content") or "").strip()
+
+            msgs.append({
+                "role": "assistant",
+                "content": reply
+            })
+
+        if not reply:
+            reply = (
+                "I couldn't finish that. Try a more specific request, "
+                "for example: 'Give me 2 odds from Europa League tonight'."
+            )
+
+        trim_history(msgs)
 
         return {
             "reply": reply,
@@ -871,6 +942,9 @@ def chat(c: Chat):
         }
 
     except Exception as e:
+
+        traceback.print_exc()
+        print("CHAT ERROR:", e)
 
         del msgs[previous_length:]
 
