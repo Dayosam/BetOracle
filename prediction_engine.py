@@ -2,21 +2,31 @@
 BetOracle deterministic prediction engine.
 
 Prediction requests are handled here instead of Groq.
-Groq remains available for normal chat and explanations.
 
 Uses:
     sportapi.fixtures()
     sportapi.stats()
     sportybet.get_markets()
 
-The engine never creates booking codes automatically.
+Features:
+    - Reads nested SportAPI statistics correctly.
+    - Checks recent form, home/away form, league table and H2H.
+    - Retrieves SportyBet markets.
+    - Filters invalid markets and odds.
+    - Removes duplicate selections.
+    - Ranks qualifying selections using evidence coverage.
+    - Provides diagnostic information when no picks qualify.
+    - Never creates booking codes automatically.
 """
 
 import re
 import math
 from datetime import date, timedelta
-from difflib import SequenceMatcher
 
+
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
 
 def _get(data, *keys, default=None):
     if not isinstance(data, dict):
@@ -30,7 +40,11 @@ def _get(data, *keys, default=None):
 
 
 def _normalise(value):
-    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+    return re.sub(
+        r"[^a-z0-9]",
+        "",
+        str(value or "").lower()
+    )
 
 
 def _team_name(fixture, side):
@@ -45,7 +59,13 @@ def _team_name(fixture, side):
     )
 
     if isinstance(value, dict):
-        value = _get(value, "name", "team_name", "teamName", default="")
+        value = _get(
+            value,
+            "name",
+            "team_name",
+            "teamName",
+            default=""
+        )
 
     return str(value or "").strip()
 
@@ -60,10 +80,20 @@ def _team_id(fixture, side):
     )
 
     if value is None:
-        team = _get(fixture, side, f"{side}_team", f"{side}Team")
+        team = _get(
+            fixture,
+            side,
+            f"{side}_team",
+            f"{side}Team"
+        )
 
         if isinstance(team, dict):
-            value = _get(team, "id", "team_id", "teamId")
+            value = _get(
+                team,
+                "id",
+                "team_id",
+                "teamId"
+            )
 
     try:
         return int(value)
@@ -81,10 +111,19 @@ def _league_id(fixture):
     )
 
     if value is None:
-        league = _get(fixture, "league", "competition")
+        league = _get(
+            fixture,
+            "league",
+            "competition"
+        )
 
         if isinstance(league, dict):
-            value = _get(league, "id", "league_id", "leagueId")
+            value = _get(
+                league,
+                "id",
+                "league_id",
+                "leagueId"
+            )
 
     try:
         return int(value)
@@ -104,7 +143,12 @@ def _league_name(fixture):
     )
 
     if isinstance(value, dict):
-        value = _get(value, "name", "league_name", default="")
+        value = _get(
+            value,
+            "name",
+            "league_name",
+            default=""
+        )
 
     return str(value or "")
 
@@ -128,75 +172,207 @@ def _as_list(value):
         return value
 
     if isinstance(value, dict):
-        for key in ("response", "data", "fixtures", "results"):
+        for key in (
+            "response",
+            "data",
+            "fixtures",
+            "results"
+        ):
             if isinstance(value.get(key), list):
                 return value[key]
 
     return []
 
 
+# ============================================================
+# STATISTICS EVIDENCE DETECTION
+# ============================================================
+
 def _stats_quality(stats):
     """
-    Check whether the statistics response contains usable evidence.
+    Inspect nested SportAPI statistics.
 
-    This does not manufacture probabilities or confidence percentages.
+    SportAPI returns statistics in this structure:
+
+        {
+            "home": {
+                "last5_overall": [],
+                "last5_at_home": []
+            },
+            "away": {
+                "last5_overall": [],
+                "last5_away": []
+            },
+            "h2h": []
+        }
+
+    This function checks the nested information rather than
+    looking only at the top-level dictionary keys.
     """
 
     if not isinstance(stats, dict):
         return 0, []
 
-    keys = " ".join(str(key) for key in stats.keys()).lower()
-
     evidence = []
 
-    checks = [
-        ("league table", ("standing", "table")),
-        ("head-to-head", ("h2h", "head")),
-        ("recent form", ("form", "results", "last")),
-        ("home form", ("home",)),
-        ("away form", ("away",))
-    ]
+    home = stats.get("home", {})
+    away = stats.get("away", {})
+    h2h = stats.get("h2h", [])
 
-    for label, patterns in checks:
-        if any(pattern in keys for pattern in patterns):
-            evidence.append(label)
+    if not isinstance(home, dict):
+        home = {}
+
+    if not isinstance(away, dict):
+        away = {}
+
+    # Overall recent form.
+    home_form = home.get("last5_overall", [])
+    away_form = away.get("last5_overall", [])
+
+    if home_form or away_form:
+        evidence.append("recent form")
+
+    # Home team's home form.
+    if home.get("last5_at_home"):
+        evidence.append("home form")
+
+    # Away team's away form.
+    if away.get("last5_away"):
+        evidence.append("away form")
+
+    # League table.
+    if (
+        home.get("position") is not None
+        and away.get("position") is not None
+    ):
+        evidence.append("league table")
+
+    # Head-to-head.
+    if isinstance(h2h, list) and h2h:
+        evidence.append("head-to-head")
 
     return len(evidence), evidence
 
 
+# ============================================================
+# STATISTICS SUMMARY
+# ============================================================
+
 def _stats_summary(stats):
+    """
+    Create a readable summary of nested SportAPI statistics.
+    """
+
     if not isinstance(stats, dict):
         return "No usable statistics were returned."
 
     parts = []
 
-    for key, value in stats.items():
-        name = str(key).lower()
+    home = stats.get("home", {})
+    away = stats.get("away", {})
+    h2h = stats.get("h2h", [])
 
-        if any(word in name for word in (
-            "standing",
-            "table",
-            "h2h",
-            "form",
-            "home",
-            "away"
-        )):
-            text = str(value)
+    if not isinstance(home, dict):
+        home = {}
 
-            if len(text) > 450:
-                text = text[:450] + "..."
+    if not isinstance(away, dict):
+        away = {}
 
-            parts.append(f"{key}: {text}")
+    def add_section(title, data):
+        if not data:
+            return
+
+        text = str(data)
+
+        if len(text) > 450:
+            text = text[:450] + "..."
+
+        parts.append(f"{title}: {text}")
+
+    # Home team information.
+    home_table = {
+        "team": home.get("team"),
+        "position": home.get("position"),
+        "played": home.get("played"),
+        "won": home.get("won"),
+        "draw": home.get("draw"),
+        "lost": home.get("lost"),
+        "goals_for": home.get("goals_for"),
+        "goals_against": home.get("goals_against")
+    }
+
+    home_table = {
+        key: value
+        for key, value in home_table.items()
+        if value is not None
+    }
+
+    add_section("Home team statistics", home_table)
+
+    add_section(
+        "Home recent form",
+        home.get("last5_overall")
+    )
+
+    add_section(
+        "Home form at home",
+        home.get("last5_at_home")
+    )
+
+    # Away team information.
+    away_table = {
+        "team": away.get("team"),
+        "position": away.get("position"),
+        "played": away.get("played"),
+        "won": away.get("won"),
+        "draw": away.get("draw"),
+        "lost": away.get("lost"),
+        "goals_for": away.get("goals_for"),
+        "goals_against": away.get("goals_against")
+    }
+
+    away_table = {
+        key: value
+        for key, value in away_table.items()
+        if value is not None
+    }
+
+    add_section("Away team statistics", away_table)
+
+    add_section(
+        "Away recent form",
+        away.get("last5_overall")
+    )
+
+    add_section(
+        "Away form away from home",
+        away.get("last5_away")
+    )
+
+    # Head-to-head.
+    add_section("Head-to-head", h2h)
 
     if not parts:
-        return "No recognised form, table or H2H information was returned."
+        return (
+            "No recognised form, table or H2H "
+            "information was returned."
+        )
 
     return " | ".join(parts)[:1300]
 
 
+# ============================================================
+# SPORTYBET MARKET HELPERS
+# ============================================================
+
 def _market_rows(raw):
     if isinstance(raw, dict):
-        for key in ("markets", "odds", "data", "results"):
+        for key in (
+            "markets",
+            "odds",
+            "data",
+            "results"
+        ):
             if isinstance(raw.get(key), list):
                 return raw[key]
 
@@ -252,12 +428,14 @@ def _market_reference(market):
 
 def _market_candidates(rows):
     """
-    Only accept recognised goal markets with a valid price and reference.
+    Accept recognised goal markets with valid odds
+    and a selection reference.
     """
 
     accepted = []
 
     for market in rows:
+
         if not isinstance(market, dict):
             continue
 
@@ -282,6 +460,10 @@ def _market_candidates(rows):
 
     return accepted
 
+
+# ============================================================
+# PICK REASON
+# ============================================================
 
 def _reason(market, evidence):
     market_name = _get(
@@ -309,6 +491,10 @@ def _reason(market, evidence):
     )
 
 
+# ============================================================
+# MAIN PREDICTION ENGINE
+# ============================================================
+
 def predict(
     sportapi_module,
     sportybet_module,
@@ -317,13 +503,18 @@ def predict(
     date_to=None,
     league=None,
     min_odds=1.15,
-    max_candidates=12
+    max_candidates=80
 ):
     """
     Generate evidence-screened football predictions.
 
-    This function does not call Groq.
-    This function does not create booking codes.
+    This function:
+        - Does not call Groq.
+        - Does not create booking codes.
+        - Retrieves fixtures from SportAPI.
+        - Checks available statistics.
+        - Retrieves SportyBet markets.
+        - Returns only selections that pass the checks.
     """
 
     count = max(1, min(int(count), 20))
@@ -333,6 +524,10 @@ def predict(
     date_to = date_to or (
         date.today() + timedelta(days=1)
     ).isoformat()
+
+    # --------------------------------------------------------
+    # 1. FETCH FIXTURES
+    # --------------------------------------------------------
 
     fixtures_raw = sportapi_module.fixtures(
         "football",
@@ -344,10 +539,12 @@ def predict(
     fixtures = _as_list(fixtures_raw)
 
     candidates = []
+    rejected_fixtures = 0
 
     for fixture in fixtures:
 
         if not isinstance(fixture, dict):
+            rejected_fixtures += 1
             continue
 
         home = _team_name(fixture, "home")
@@ -358,9 +555,15 @@ def predict(
         league_id = _league_id(fixture)
 
         if not home or not away:
+            rejected_fixtures += 1
             continue
 
-        if home_id is None or away_id is None or league_id is None:
+        if (
+            home_id is None
+            or away_id is None
+            or league_id is None
+        ):
+            rejected_fixtures += 1
             continue
 
         candidates.append((
@@ -372,10 +575,24 @@ def predict(
             league_id
         ))
 
+    # Analyse more fixtures instead of stopping at 12.
     candidates = candidates[:max_candidates]
+
+    # --------------------------------------------------------
+    # 2. INITIALISE DIAGNOSTICS
+    # --------------------------------------------------------
 
     ranked = []
     errors = []
+
+    stats_checked = 0
+    stats_rejected = 0
+    markets_checked = 0
+    markets_rejected = 0
+
+    # --------------------------------------------------------
+    # 3. ANALYSE EACH FIXTURE
+    # --------------------------------------------------------
 
     for (
         fixture,
@@ -388,7 +605,7 @@ def predict(
 
         try:
 
-            # Get team and match statistics.
+            # Fetch team and match statistics.
             stats = sportapi_module.stats(
                 "football",
                 home_id,
@@ -396,30 +613,50 @@ def predict(
                 league_id
             )
 
-            evidence_score, evidence_labels = _stats_quality(stats)
+            stats_checked += 1
 
-            # Reject matches with insufficient evidence.
+            evidence_score, evidence_labels = (
+                _stats_quality(stats)
+            )
+
+            # Reject matches without enough evidence.
             if evidence_score < 2:
+                stats_rejected += 1
                 continue
 
-            if not any("form" in item for item in evidence_labels):
+            # Require recent form.
+            if not any(
+                "form" in item
+                for item in evidence_labels
+            ):
+                stats_rejected += 1
                 continue
 
-            # Retrieve the available SportyBet markets.
+            evidence = _stats_summary(stats)
+
+            # ------------------------------------------------
+            # 4. RETRIEVE SPORTYBET MARKETS
+            # ------------------------------------------------
+
             markets_raw = sportybet_module.get_markets(
                 "football",
                 home,
                 away
             )
 
+            markets_checked += 1
+
             markets = _market_candidates(
                 _market_rows(markets_raw)
             )
 
             if not markets:
+                markets_rejected += 1
                 continue
 
-            evidence = _stats_summary(stats)
+            # ------------------------------------------------
+            # 5. CHECK EACH MARKET
+            # ------------------------------------------------
 
             for market in markets:
 
@@ -430,15 +667,21 @@ def predict(
 
                 text = _market_text(market)
 
-                # Ranking is based on evidence coverage.
-                # Odds are only a market availability filter.
+                # Evidence coverage ranking.
+                # This is NOT a calculated win probability.
                 specificity = (
                     1
-                    if "over 1.5" in text or "under 3.5" in text
+                    if (
+                        "over 1.5" in text
+                        or "under 3.5" in text
+                    )
                     else 0
                 )
 
-                score = evidence_score * 10 + specificity
+                score = (
+                    evidence_score * 10
+                    + specificity
+                )
 
                 ranked.append({
                     "home": home,
@@ -446,6 +689,7 @@ def predict(
                     "sport": "football",
                     "kickoff": _kickoff(fixture),
                     "league": _league_name(fixture),
+
                     "market": str(_get(
                         market,
                         "market",
@@ -454,6 +698,7 @@ def predict(
                         "name",
                         default=""
                     )),
+
                     "pick": str(_get(
                         market,
                         "pick",
@@ -462,19 +707,30 @@ def predict(
                         "label",
                         default=""
                     )),
+
                     "odds": odds,
+
                     "ref": _market_reference(market),
-                    "reason": _reason(market, evidence),
+
+                    "reason": _reason(
+                        market,
+                        evidence
+                    ),
+
                     "_score": score
                 })
 
         except Exception as exc:
 
             errors.append(
-                f"{home} v {away}: {type(exc).__name__}: {exc}"
+                f"{home} v {away}: "
+                f"{type(exc).__name__}: {exc}"
             )
 
-    # Remove duplicate selections.
+    # --------------------------------------------------------
+    # 6. REMOVE DUPLICATE SELECTIONS
+    # --------------------------------------------------------
+
     unique = {}
 
     for pick in ranked:
@@ -494,6 +750,10 @@ def predict(
 
     ranked = list(unique.values())
 
+    # --------------------------------------------------------
+    # 7. RANK QUALIFYING SELECTIONS
+    # --------------------------------------------------------
+
     ranked.sort(
         key=lambda item: (
             item["_score"],
@@ -504,16 +764,21 @@ def predict(
 
     selected = ranked[:count]
 
+    # Remove internal ranking score.
     for pick in selected:
         pick.pop("_score", None)
+
+    # --------------------------------------------------------
+    # 8. GENERATE RESPONSE
+    # --------------------------------------------------------
 
     if not selected:
 
         reply = (
             f"I couldn't find qualifying picks between "
             f"{date_from} and {date_to}. "
-            "I won't force selections when the available evidence "
-            "is insufficient."
+            "I won't force selections when the available "
+            "evidence is insufficient."
         )
 
     else:
@@ -526,6 +791,7 @@ def predict(
 
             lines.append(
                 f"{index}. {pick['home']} v {pick['away']}\n"
+                f"League: {pick['league']}\n"
                 f"Market: {pick['market']} — {pick['pick']}\n"
                 f"Odds: {pick['odds']:.2f}\n"
                 f"Reason: {pick['reason']}"
@@ -534,16 +800,38 @@ def predict(
         if len(selected) < count:
 
             lines.append(
-                f"Only {len(selected)} picks passed the checks. "
-                f"I did not fill the remaining {count - len(selected)} places."
+                f"Only {len(selected)} picks passed "
+                f"the checks. I did not fill the remaining "
+                f"{count - len(selected)} places."
             )
 
         reply = "\n\n".join(lines)
 
+    # --------------------------------------------------------
+    # 9. RETURN RESULTS AND DIAGNOSTICS
+    # --------------------------------------------------------
+
     return {
         "reply": reply,
         "ticket": selected,
+
+        "fixtures_received": len(fixtures),
+
         "candidates_checked": len(candidates),
-        "candidate_errors": errors[:5],
+
+        "fixtures_rejected": rejected_fixtures,
+
+        "statistics_checked": stats_checked,
+
+        "statistics_rejected": stats_rejected,
+
+        "markets_checked": markets_checked,
+
+        "markets_rejected": markets_rejected,
+
+        "qualifying_selections": len(selected),
+
+        "candidate_errors": errors[:10],
+
         "booking_created": False
     }
