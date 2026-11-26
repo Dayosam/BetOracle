@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-anthropic
 httpx
 python-dotenv
+google-genai
