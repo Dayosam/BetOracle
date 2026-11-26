@@ -1072,8 +1072,6 @@ def chat(c: Chat):
 
     lock = get_session_lock(session_id)
 
-    # FIX 1: Add a timeout so the lock cannot get stuck forever.
-    # It will wait up to 60 seconds for the previous request to finish.
     if not lock.acquire(timeout=60):
 
         raise HTTPException(
@@ -1102,10 +1100,6 @@ def chat(c: Chat):
         if prediction_request:
 
             try:
-                # FIX 2: Run the prediction engine in a separate thread
-                # with a hard 50-second timeout. If your external API
-                # (SportyBet/SportAPI) hangs, this stops the entire
-                # server from locking up.
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     future = executor.submit(
                         prediction_engine.predict,
@@ -1341,6 +1335,48 @@ def chat(c: Chat):
     finally:
 
         lock.release()
+
+
+# =========================================================
+# DEBUG ENDPOINT
+# TEMPORARY: USE THIS TO SEE WHAT THE APIS ARE RETURNING
+# =========================================================
+
+@app.get("/api/debug-engine")
+def debug_engine():
+    try:
+        # Fetch fixtures for today
+        fixtures = sportapi.fixtures("football", date.today().isoformat(), date.today().isoformat(), None)
+        
+        if not fixtures:
+            return {"error": "No fixtures returned at all."}
+            
+        # Grab the first fixture
+        fx = fixtures[0] if isinstance(fixtures, list) else fixtures.get("response", [{}])[0]
+        
+        home = fx.get("home", {}).get("name") if isinstance(fx.get("home"), dict) else fx.get("home")
+        away = fx.get("away", {}).get("name") if isinstance(fx.get("away"), dict) else fx.get("away")
+        
+        home_id = fx.get("home_id")
+        away_id = fx.get("away_id")
+        league_id = fx.get("league_id")
+        
+        if not home_id:
+            return {"error": "Could not extract team IDs", "raw_fixture": fx}
+
+        # Fetch stats
+        stats = sportapi.stats("football", home_id, away_id, league_id)
+        
+        # Fetch markets
+        markets = sportybet.get_markets("football", home, away)
+
+        return {
+            "fixture_found": f"{home} vs {away}",
+            "raw_stats_returned": stats,
+            "raw_markets_returned": markets
+        }
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
 
 
 # =========================================================
