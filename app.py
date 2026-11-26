@@ -39,7 +39,7 @@ SESSIONS = {}
 
 
 # =========================================================
-# AI SYSTEM INSTRUCTIONS
+# SYSTEM INSTRUCTIONS
 # =========================================================
 
 SYSTEM = f"""You are BetOracle, a sharp, friendly sports-betting assistant for Nigerian bettors.
@@ -147,7 +147,6 @@ TOOLS = [
             "required": ["sport", "date_from", "date_to"]
         }
     },
-
     {
         "name": "get_markets",
         "description": "All SportyBet markets and odds for one match.",
@@ -165,7 +164,6 @@ TOOLS = [
             "required": ["sport", "home", "away"]
         }
     },
-
     {
         "name": "read_code",
         "description": "Load an existing booking code.",
@@ -178,7 +176,6 @@ TOOLS = [
             "required": ["code"]
         }
     },
-
     {
         "name": "get_stats",
         "description": "Evidence for football or basketball: table position, form and head-to-head.",
@@ -193,7 +190,6 @@ TOOLS = [
             "required": ["sport", "home_id", "away_id", "league_id"]
         }
     },
-
     {
         "name": "add_to_ticket",
         "description": "Add picks to the user's ticket. Each needs a reason.",
@@ -230,7 +226,6 @@ TOOLS = [
             "required": ["selections"]
         }
     },
-
     {
         "name": "remove_legs",
         "description": "Remove ticket legs by number or odds range.",
@@ -248,7 +243,6 @@ TOOLS = [
             }
         }
     },
-
     {
         "name": "split_ticket",
         "description": "Split the ticket into N slips.",
@@ -260,7 +254,6 @@ TOOLS = [
             "required": ["parts"]
         }
     },
-
     {
         "name": "get_team_stat_history",
         "description": "Football team history for shots, fouls, tackles and cards.",
@@ -274,7 +267,6 @@ TOOLS = [
             "required": ["team_id", "league_id"]
         }
     },
-
     {
         "name": "get_corner_history",
         "description": "Team corner history and averages.",
@@ -287,7 +279,6 @@ TOOLS = [
             "required": ["team"]
         }
     },
-
     {
         "name": "convert_code",
         "description": "Convert a booking code from one Nigerian bookmaker to another.",
@@ -302,7 +293,6 @@ TOOLS = [
             "required": ["code", "target"]
         }
     },
-
     {
         "name": "clear_ticket",
         "description": "Empty the ticket.",
@@ -311,7 +301,6 @@ TOOLS = [
             "properties": {}
         }
     },
-
     {
         "name": "book_ticket",
         "description": "Book the ticket on SportyBet and return booking codes.",
@@ -320,7 +309,6 @@ TOOLS = [
             "properties": {}
         }
     },
-
     {
         "name": "convert_ticket",
         "description": "Convert the ticket for another platform: " + ", ".join(PLATFORMS),
@@ -655,13 +643,12 @@ def run_tool(name, a, s):
 
 
 # =========================================================
-# MISTRAL API
+# MISTRAL API REQUEST
 # =========================================================
 
 def mistral_request(messages, use_tools=True):
 
     if not MISTRAL_API_KEY:
-
         raise RuntimeError(
             "MISTRAL_API_KEY is missing from Render environment variables."
         )
@@ -674,7 +661,6 @@ def mistral_request(messages, use_tools=True):
     }
 
     if use_tools:
-
         payload["tools"] = MISTRAL_TOOLS
         payload["tool_choice"] = "auto"
 
@@ -693,13 +679,11 @@ def mistral_request(messages, use_tools=True):
         )
 
     except httpx.TimeoutException:
-
         raise RuntimeError(
             "Mistral request timed out. Please try again."
         )
 
     except httpx.RequestError as e:
-
         raise RuntimeError(
             f"Mistral connection error: {e}"
         )
@@ -718,7 +702,6 @@ def mistral_request(messages, use_tools=True):
     data = response.json()
 
     if not data.get("choices"):
-
         raise RuntimeError(
             "Mistral returned an empty response."
         )
@@ -727,7 +710,7 @@ def mistral_request(messages, use_tools=True):
 
 
 # =========================================================
-# CHAT MODEL
+# FASTAPI APPLICATION
 # =========================================================
 
 class Chat(BaseModel):
@@ -736,6 +719,40 @@ class Chat(BaseModel):
 
 
 app = FastAPI()
+
+
+# =========================================================
+# MISTRAL DIRECT TEST
+# =========================================================
+
+@app.get("/api/test-mistral")
+def test_mistral():
+
+    try:
+
+        result = mistral_request(
+            [
+                {
+                    "role": "user",
+                    "content": "Reply with: Mistral is working."
+                }
+            ],
+            use_tools=False
+        )
+
+        return {
+            "success": True,
+            "model": MODEL,
+            "reply": result.get("content")
+        }
+
+    except Exception as e:
+
+        return {
+            "success": False,
+            "model": MODEL,
+            "error": str(e)
+        }
 
 
 # =========================================================
@@ -757,12 +774,18 @@ def chat(c: Chat):
 
     msgs = s["history"]
 
+    # Remember the previous history length so a failed
+    # request can be rolled back safely.
+    previous_length = len(msgs)
+
     msgs.append({
         "role": "user",
         "content": c.message
     })
 
     try:
+
+        reply = ""
 
         for step in range(MAX_STEPS):
 
@@ -778,13 +801,12 @@ def chat(c: Chat):
 
             assistant_message = {
                 "role": "assistant",
-                "content": r.get("content"),
+                "content": r.get("content")
             }
 
             tool_calls = r.get("tool_calls") or []
 
             if tool_calls:
-
                 assistant_message["tool_calls"] = tool_calls
 
             msgs.append(assistant_message)
@@ -792,7 +814,6 @@ def chat(c: Chat):
             if not tool_calls:
 
                 reply = r.get("content") or ""
-
                 break
 
             for call in tool_calls:
@@ -813,19 +834,17 @@ def chat(c: Chat):
                     if not isinstance(arguments, dict):
                         arguments = {}
 
-                except Exception:
-
-                    result = {
-                        "error": "Invalid tool arguments returned by Mistral."
-                    }
-
-                else:
-
                     result = run_tool(
                         tool_name,
                         arguments,
                         s
                     )
+
+                except Exception as e:
+
+                    result = {
+                        "error": f"{type(e).__name__}: {e}"
+                    }
 
                 msgs.append({
                     "role": "tool",
@@ -843,7 +862,7 @@ def chat(c: Chat):
                 "Please narrow down your request."
             )
 
-        # Keep conversation history within limits.
+        # Keep the most recent conversation messages.
         if len(msgs) > MAX_HISTORY:
             del msgs[:-MAX_HISTORY]
 
@@ -855,10 +874,8 @@ def chat(c: Chat):
 
     except Exception as e:
 
-        # Remove the incomplete user turn and tool messages.
-        # Keep the session usable for the next request.
-        if msgs and msgs[-1].get("role") != "assistant":
-            pass
+        # Roll back incomplete conversation history.
+        del msgs[previous_length:]
 
         raise HTTPException(
             status_code=502,
@@ -867,7 +884,7 @@ def chat(c: Chat):
 
 
 # =========================================================
-# OTHER ENDPOINTS
+# USAGE ENDPOINT
 # =========================================================
 
 @app.get("/api/usage")
@@ -877,6 +894,10 @@ def usage():
         "sportapi_calls_today": count_call() - 1
     }
 
+
+# =========================================================
+# BOOKMAKER ENDPOINT
+# =========================================================
 
 @app.get("/api/bookmakers")
 def bookmaker_status():
@@ -889,6 +910,10 @@ def bookmaker_status():
         for k, v in bookmakers.BOOKMAKERS.items()
     }
 
+
+# =========================================================
+# HEALTH CHECK
+# =========================================================
 
 @app.get("/health")
 def health():
@@ -915,6 +940,7 @@ app.mount(
         html=True
     )
 )
+
 
 # Run locally:
 # uvicorn app:app --reload
