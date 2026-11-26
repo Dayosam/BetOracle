@@ -1,196 +1,136 @@
-"""
-BetOracle AI — Gemini-backed FastAPI application.
-
-Keeps the existing frontend contract:
-  POST /api/chat -> {"reply": ..., "ticket": [...], "codes": [...]}
-  GET  /api/usage
-  GET  /api/bookmakers
-  GET  /health
-
-Required modules: agent.py, sportybet.py, sportapi.py, corners.py,
-bookmakers.py, msport.py, convert_router.py, cache.py
-Optional: ticket_builder.py
-"""
-
 import os
-import re
 import json
 import math
-import logging
-from datetime import date
-from pathlib import Path
-from typing import Any
-
 import httpx
+
+from datetime import date
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-load_dotenv()
-log = logging.getLogger("betoracle.app")
-
-# Gemini engine — this replaces the old Anthropic client.
-import agent
 import sportybet
 import sportapi
 import corners
 import bookmakers
 import msport
 import convert_router as router
-from cache import count_call
 
-try:
-    import ticket_builder
-except ImportError:
-    ticket_builder = None
+from cache import cached, count_call
+
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+load_dotenv()
+
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
+MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+
+MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
+
+MAX_STEPS = int(os.getenv("AI_MAX_STEPS", "12"))
+MAX_HISTORY = int(os.getenv("AI_HISTORY_LIMIT", "30"))
 
 PLATFORMS = list(bookmakers.BOOKMAKERS)
-SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "604800"))
-MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "2000"))
-MAX_TICKET_LEGS = int(os.getenv("MAX_TICKET_LEGS", "50"))
 
-# In-memory fallback is used only if Upstash is not configured.
-SESSIONS: dict[str, dict] = {}
-UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
-UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+SESSIONS = {}
 
 
-def _session_key(session_id: str) -> str:
-    return "betoracle:session:" + session_id
+# =========================================================
+# AI SYSTEM INSTRUCTIONS
+# =========================================================
 
+SYSTEM = f"""You are BetOracle, a sharp, friendly sports-betting assistant for Nigerian bettors.
 
-def _redis_request(command: list):
-    if not (UPSTASH_URL and UPSTASH_TOKEN):
-        return None
-    try:
-        response = httpx.post(
-            UPSTASH_URL,
-            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
-            json=command,
-            timeout=8.0,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("error"):
-            raise RuntimeError(str(payload["error"]))
-        return payload.get("result")
-    except Exception:
-        log.exception("Upstash request failed")
-        return None
+Today is {date.today():%A %Y-%m-%d}.
 
+Talk like a normal person, short and direct.
 
-def _default_state() -> dict:
-    return {
-        "history": [],
-        "ticket": [],
-        "slips": [],
-        "codes": [],
-        "stats_seen": {},
-    }
+Follow the user's instructions exactly.
 
+For example, "book me weekend matches" means:
+get_fixtures for Saturday and Sunday, get_markets and get_stats, add_to_ticket, then book_ticket.
 
-def _serialize_state(state: dict) -> dict:
-    return {
-        "history": agent.dump_history(state.get("history", [])),
-        "ticket": state.get("ticket", []),
-        "slips": state.get("slips", []),
-        "codes": state.get("codes", []),
-        "stats_seen": state.get("stats_seen", {}),
-    }
+RULES:
 
+Never invent odds, fixtures or statistics. Use tools.
 
-def _deserialize_state(data: dict) -> dict:
-    state = _default_state()
-    state.update(data or {})
-    state["history"] = agent.load_history(state.get("history", []))
-    return state
+For every football or basketball selection, call get_stats first.
 
+Its reason MUST give the real numbers:
+- Each team's league position and record.
+- Each team's last 5 results.
+- The home team's last 5 at home.
+- The away team's last 5 away.
+- Head-to-head.
+- Explain how the evidence supports the exact market.
 
-def get_state(session_id: str) -> dict:
-    raw = _redis_request(["GET", _session_key(session_id)])
-    if isinstance(raw, str):
-        try:
-            return _deserialize_state(json.loads(raw))
-        except Exception:
-            log.warning("Stored session could not be decoded; starting a clean session.")
-    if session_id not in SESSIONS:
-        SESSIONS[session_id] = _default_state()
-    return SESSIONS[session_id]
+If a sport or market has no statistics source, say plainly that the pick rests on odds only.
 
+Any market on SportyBet is allowed:
+corners, fouls, shots, tackles, cards, player props, basketball, darts, tennis and more.
 
-def save_state(session_id: str, state: dict) -> None:
-    data = json.dumps(_serialize_state(state), default=str, separators=(",", ":"))
-    if UPSTASH_URL and UPSTASH_TOKEN:
-        # Upstash REST accepts SET key value EX seconds.
-        _redis_request(["SET", _session_key(session_id), data, "EX", SESSION_TTL])
-    else:
-        SESSIONS[session_id] = state
+For a target like "give me 25 odds mixing football, basketball and darts":
+gather real odds with get_markets for each sport, pick the best-supported selections, and stop when combined odds reach the target.
 
+If odds are unavailable for a sport, say so. Never fill the gap with guessed odds.
 
-def _team_key(home: str, away: str) -> str:
-    clean = lambda s: re.sub(r"[^a-z0-9]+", "", str(s).lower())
-    return clean(home) + "|" + clean(away)
+Booking creates a booking code only. You never place real-money bets.
 
+No pick is guaranteed.
 
-def _product(legs: list) -> float:
-    try:
-        return round(math.prod(float(x["odds"]) for x in legs), 2)
-    except (TypeError, ValueError, KeyError):
-        return 0.0
+You can edit tickets on request:
+- Remove legs by number or odds range.
+- Replace legs.
+- Convert every leg to another market.
+- Split into N slips with split_ticket.
+- Book each with book_ticket.
 
+When the user gives a target total odds, keep the total within a few percent of it after every edit and state the final total.
 
-def _names(legs: list) -> list:
-    return [
-        f'{x.get("home", "?")} v {x.get("away", "?")}: '
-        f'{x.get("market", "?")} {x.get("pick", "?")} @ {x.get("odds", "?")}'
-        for x in legs
-    ]
+"Value picks" means avoid legs under 1.15 odds.
 
+Start replies with the booking code when there is one.
 
-SYSTEM = f"""You are BetOracle, a sports-betting research and booking-code assistant for Nigerian users.
-Today is {date.today():%A %Y-%m-%d}. Reply in the user's language, naturally and concisely.
+When asked why a leg was chosen, answer from the numbers you gathered.
 
-CORE RULES
-- Never invent fixtures, odds, statistics, market names, probabilities, confidence scores, or booking codes.
-- Use tools for live fixtures, markets, statistics, code reading and conversion.
-- SportAPI.ai is the primary data source for football and basketball fixtures/statistics.
-- SportyBet Nigeria is the default source of markets, odds and booking codes.
-- Analyse match evidence independently of bookmaker odds. Use odds only to choose an actual available market.
-- If evidence is insufficient, say NO BET. Never force a selection just to reach a target total.
-- A combined odds target is not a probability or a guarantee.
-- A booking code is not a placed bet. Never claim money has been staked.
-- Do not silently remove, substitute or alter any selection. List unavailable legs and ask the user before partial conversion.
-- Only claim a booking code exists when book_ticket returns one.
+For corner picks call get_corner_history for both teams.
 
-EVIDENCE
-- For football and basketball selections, call get_stats before recommending or adding a selection.
-- Explain the actual returned statistics, including standings/form/H2H where the provider supplies them.
-- Do not invent missing fields. Clearly state when a statistic is unavailable.
-- For football corners, call get_corner_history for both teams.
-- For shots, shots on target, fouls, tackles or yellow cards, call get_team_stat_history.
-- If the requested market has no relevant statistics source, say the selection is based on limited evidence or odds only; do not present it as strongly researched.
-- Do not claim that a tool was used unless it actually returned usable data.
+For shots, fouls, tackles or cards call get_team_stat_history.
+Cite the averages and how many of the last matches cleared the line.
 
-TICKETS
-- Use get_markets to find the exact market and copy its ref exactly.
-- Every selection added must have a real market ref, real odds, and an evidence-based reason.
-- Respect the user's requested target odds, but do not add weak picks to reach it.
-- When asked to remove, replace, split or convert selections, preserve every unaffected leg.
-- For a booking code, first show the ticket summary and obtain clear user approval before calling book_ticket.
-- If the user explicitly asks in the current message to generate/book/create the booking code for the ticket, that is approval for code generation.
-- A code is only created after the user has approved and the booking tool succeeds.
-- Start with the booking code when one has been returned.
+Use get_markets with the search keyword for the market the user wants.
 
-PLATFORMS
-- Users should not need a bookmaker menu. Understand destinations from ordinary language.
-- Use convert_code when converting an existing code, and convert_ticket for the current in-memory ticket.
-- Only connected bookmaker adapters can produce codes. If no adapter exists, provide a clearly labelled manual slip.
-- Never state that a manual slip is a converted booking code.
+Copy each chosen selection's ref exactly.
 
-If a tool fails, explain plainly what failed and what information is missing.
+A booking code is a SportyBet slip that stakes nothing.
+
+If the user pastes a booking code:
+call read_code, leave platform empty unless they said which bookmaker. It is auto-detected.
+
+Users never pick a bookmaker from a menu.
+Understand the destination from ordinary text such as:
+"convert to Bet9ja", "change this to Sporty" or "I want this on BetNaija".
+
+Then call convert_code with that target.
+
+To move a code to another bookmaker call convert_code.
+
+Never remove, replace or edit a selection silently.
+
+If any leg is suspended, not listed or missing from the created code, say exactly which and ask before continuing.
+
+Only say a code was created if a tool returned it.
+
+If a tool fails, tell the user plainly what is missing.
 """
 
+
+# =========================================================
+# TOOL DEFINITIONS
+# =========================================================
 
 TOOLS = [
     {
@@ -202,56 +142,61 @@ TOOLS = [
                 "sport": {"type": "string"},
                 "date_from": {"type": "string"},
                 "date_to": {"type": "string"},
-                "league": {"type": "string"},
+                "league": {"type": "string"}
             },
-            "required": ["sport", "date_from", "date_to"],
-        },
+            "required": ["sport", "date_from", "date_to"]
+        }
     },
+
     {
         "name": "get_markets",
-        "description": "Get SportyBet markets and current odds for one match. Use exact outcome refs.",
+        "description": "All SportyBet markets and odds for one match.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "sport": {"type": "string"},
                 "home": {"type": "string"},
                 "away": {"type": "string"},
-                "search": {"type": "string"},
+                "search": {
+                    "type": "string",
+                    "description": "Comma-separated market keywords."
+                }
             },
-            "required": ["sport", "home", "away"],
-        },
+            "required": ["sport", "home", "away"]
+        }
     },
+
     {
         "name": "read_code",
-        "description": "Read an existing bookmaker booking code and load its selections into the current ticket.",
+        "description": "Load an existing booking code.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "code": {"type": "string"},
-                "platform": {"type": "string"},
+                "platform": {"type": "string"}
             },
-            "required": ["code"],
-        },
+            "required": ["code"]
+        }
     },
+
     {
         "name": "get_stats",
-        "description": "Retrieve football or basketball evidence: standings, recent form, venue form and H2H.",
+        "description": "Evidence for football or basketball: table position, form and head-to-head.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "sport": {"type": "string"},
-                "home_id": {"type": ["integer", "string"]},
-                "away_id": {"type": ["integer", "string"]},
-                "league_id": {"type": ["integer", "string"]},
-                "home": {"type": "string"},
-                "away": {"type": "string"},
+                "home_id": {"type": "integer"},
+                "away_id": {"type": "integer"},
+                "league_id": {"type": ["integer", "string"]}
             },
-            "required": ["sport", "home_id", "away_id", "league_id", "home", "away"],
-        },
+            "required": ["sport", "home_id", "away_id", "league_id"]
+        }
     },
+
     {
         "name": "add_to_ticket",
-        "description": "Add validated selections. Use exact refs returned by get_markets.",
+        "description": "Add picks to the user's ticket. Each needs a reason.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -268,356 +213,708 @@ TOOLS = [
                             "market": {"type": "string"},
                             "pick": {"type": "string"},
                             "odds": {"type": "number"},
-                            "reason": {"type": "string"},
+                            "reason": {"type": "string"}
                         },
-                        "required": ["home", "away", "market", "pick", "odds", "reason", "ref"],
-                    },
+                        "required": [
+                            "home",
+                            "away",
+                            "market",
+                            "pick",
+                            "odds",
+                            "reason",
+                            "ref"
+                        ]
+                    }
                 }
             },
-            "required": ["selections"],
-        },
+            "required": ["selections"]
+        }
     },
+
     {
         "name": "remove_legs",
-        "description": "Remove ticket legs by 1-based index and/or inclusive odds range.",
+        "description": "Remove ticket legs by number or odds range.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "indices": {"type": "array", "items": {"type": "integer"}},
-                "odds_between": {"type": "array", "items": {"type": "number"}},
-            },
-        },
+                "indices": {
+                    "type": "array",
+                    "items": {"type": "integer"}
+                },
+                "odds_between": {
+                    "type": "array",
+                    "items": {"type": "number"}
+                }
+            }
+        }
     },
+
     {
         "name": "split_ticket",
-        "description": "Split the current ticket into N balanced slips.",
+        "description": "Split the ticket into N slips.",
         "input_schema": {
             "type": "object",
-            "properties": {"parts": {"type": "integer"}},
-            "required": ["parts"],
-        },
+            "properties": {
+                "parts": {"type": "integer"}
+            },
+            "required": ["parts"]
+        }
     },
+
     {
         "name": "get_team_stat_history",
-        "description": "Football team history for shots, shots on target, fouls, tackles and yellow cards. No corners.",
+        "description": "Football team history for shots, fouls, tackles and cards.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "team_id": {"type": "integer"},
                 "league_id": {"type": "integer"},
-                "n": {"type": "integer"},
+                "n": {"type": "integer"}
             },
-            "required": ["team_id", "league_id"],
-        },
+            "required": ["team_id", "league_id"]
+        }
     },
+
     {
         "name": "get_corner_history",
-        "description": "Football corner history for a team: corners for, against, total and averages.",
+        "description": "Team corner history and averages.",
         "input_schema": {
             "type": "object",
-            "properties": {"team": {"type": "string"}, "n": {"type": "integer"}},
-            "required": ["team"],
-        },
+            "properties": {
+                "team": {"type": "string"},
+                "n": {"type": "integer"}
+            },
+            "required": ["team"]
+        }
     },
+
     {
         "name": "convert_code",
-        "description": "Convert an existing booking code to another connected Nigerian bookmaker.",
+        "description": "Convert a booking code from one Nigerian bookmaker to another.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "source": {"type": "string"},
                 "code": {"type": "string"},
                 "target": {"type": "string"},
-                "allow_partial": {"type": "boolean"},
+                "allow_partial": {"type": "boolean"}
             },
-            "required": ["code", "target"],
-        },
+            "required": ["code", "target"]
+        }
     },
+
     {
         "name": "clear_ticket",
-        "description": "Clear all current ticket legs and split slips.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "book_ticket",
-        "description": "Generate SportyBet booking code(s) for the current approved ticket. Does not place a bet.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "convert_ticket",
-        "description": "Convert the current ticket to a bookmaker. Only connected adapters can create codes.",
+        "description": "Empty the ticket.",
         "input_schema": {
             "type": "object",
-            "properties": {"platform": {"type": "string", "enum": PLATFORMS}},
-            "required": ["platform"],
-        },
+            "properties": {}
+        }
     },
+
+    {
+        "name": "book_ticket",
+        "description": "Book the ticket on SportyBet and return booking codes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+
+    {
+        "name": "convert_ticket",
+        "description": "Convert the ticket for another platform: " + ", ".join(PLATFORMS),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "platform": {
+                    "type": "string",
+                    "enum": PLATFORMS
+                }
+            },
+            "required": ["platform"]
+        }
+    }
 ]
 
-MUTATING_TOOLS = {
-    "read_code", "add_to_ticket", "remove_legs", "split_ticket",
-    "clear_ticket", "book_ticket", "convert_code", "convert_ticket",
-}
+
+# =========================================================
+# MISTRAL TOOL FORMAT
+# =========================================================
+
+MISTRAL_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": tool["name"],
+            "description": tool["description"],
+            "parameters": tool["input_schema"]
+        }
+    }
+    for tool in TOOLS
+]
 
 
-def run_tool(name: str, a: dict, state: dict, booking_approved: bool = False) -> Any:
-    ticket = state["ticket"]
+# =========================================================
+# TICKET HELPERS
+# =========================================================
+
+def names(legs):
+    return [
+        f'{x["home"]} v {x["away"]}: {x["market"]} {x["pick"]} @ {x["odds"]}'
+        for x in legs
+    ]
+
+
+def prod(legs):
+    return round(math.prod(x["odds"] for x in legs), 2)
+
+
+# =========================================================
+# TOOL EXECUTION
+# =========================================================
+
+def run_tool(name, a, s):
+
+    t = s["ticket"]
+
     try:
+
         if name == "get_fixtures":
-            sport = str(a["sport"]).lower()
-            if sport in ("football", "soccer", "basketball"):
-                provider_sport = "basketball" if sport == "basketball" else "football"
-                return sportapi.fixtures(
-                    provider_sport, a["date_from"], a["date_to"], a.get("league")
+
+            if a["sport"].lower() in (
+                "football",
+                "soccer",
+                "basketball"
+            ):
+
+                sport = (
+                    "basketball"
+                    if a["sport"].lower() == "basketball"
+                    else "football"
                 )
-            return sportybet.list_events(a["sport"], a["date_from"], a["date_to"], a.get("league"))
+
+                return sportapi.fixtures(
+                    sport,
+                    a["date_from"],
+                    a["date_to"],
+                    a.get("league")
+                )
+
+            return sportybet.list_events(
+                a["sport"],
+                a["date_from"],
+                a["date_to"],
+                a.get("league")
+            )
 
         if name == "get_markets":
-            return sportybet.get_markets(a["sport"], a["home"], a["away"], a.get("search"))
 
-        if name == "get_stats":
-            result = sportapi.stats(
-                a["sport"], a["home_id"], a["away_id"], a["league_id"]
+            return sportybet.get_markets(
+                a["sport"],
+                a["home"],
+                a["away"],
+                a.get("search")
             )
-            if isinstance(result, dict) and not result.get("error"):
-                key = _team_key(a.get("home", ""), a.get("away", ""))
-                # Keep the raw provider response as proof that stats were fetched.
-                state["stats_seen"][key] = result
-            return result
 
         if name == "read_code":
-            result = router.read_for_chat(a["code"], a.get("platform"))
-            if isinstance(result, dict) and "legs_list" in result:
-                state["ticket"] = list(result.pop("legs_list") or [])
-                state["slips"] = []
-            return result
+
+            out = router.read_for_chat(
+                a["code"],
+                a.get("platform")
+            )
+
+            if "legs_list" in out:
+                t[:] = out.pop("legs_list")
+                s["slips"] = []
+
+            return out
+
+        if name == "get_stats":
+
+            return sportapi.stats(
+                a["sport"],
+                a["home_id"],
+                a["away_id"],
+                a["league_id"]
+            )
 
         if name == "add_to_ticket":
-            selections = a.get("selections") or []
-            if not selections:
-                return {"error": "No selections were supplied."}
-            if len(ticket) + len(selections) > MAX_TICKET_LEGS:
-                return {"error": f"Ticket limit is {MAX_TICKET_LEGS} selections."}
-            for item in selections:
-                if not item.get("ref"):
-                    return {"error": f"{item.get('home')} v {item.get('away')}: missing exact SportyBet market ref."}
-                try:
-                    odds = float(item["odds"])
-                except (TypeError, ValueError, KeyError):
-                    return {"error": "A selection has invalid odds."}
-                if not math.isfinite(odds) or odds <= 1:
-                    return {"error": "Every selection must have valid decimal odds greater than 1."}
-                if not item.get("reason") or len(str(item["reason"])) < 40:
-                    return {"error": "Each selection needs a specific evidence-based explanation."}
-                if str(item.get("sport", "football")).lower() in ("football", "soccer", "basketball"):
-                    key = _team_key(item.get("home", ""), item.get("away", ""))
-                    if not state["stats_seen"].get(key):
-                        return {
-                            "error": f"No successful get_stats result is recorded for {item.get('home')} v {item.get('away')}. Fetch its stats first. Include the exact team names in get_stats."
-                        }
-            ticket.extend(selections)
-            state["slips"] = []
-            return {"ticket_size": len(ticket), "total_odds": _product(ticket), "selections": _names(ticket)}
+
+            for x in a["selections"]:
+
+                if not x.get("ref"):
+
+                    return {
+                        "error": (
+                            f"Rejected {x['home']} v {x['away']}: "
+                            "missing ref. Call get_markets and copy "
+                            "the exact selection ref."
+                        )
+                    }
+
+                reason = x.get("reason", "")
+
+                if (
+                    x.get("sport", "football")
+                    in ("football", "basketball")
+                    and (
+                        len(reason) < 150
+                        or sum(c.isdigit() for c in reason) < 8
+                    )
+                ):
+
+                    return {
+                        "error": (
+                            f"Rejected {x['home']} v {x['away']}: "
+                            "reason must cite real statistics. "
+                            "Call get_stats and rewrite."
+                        )
+                    }
+
+            t.extend(a["selections"])
+
+            return {"ticket_size": len(t)}
+
+        if name == "clear_ticket":
+
+            t.clear()
+            s["slips"] = []
+
+            return "cleared"
+
+        if name == "get_team_stat_history":
+
+            return sportapi.team_history(
+                a["team_id"],
+                a["league_id"],
+                a.get("n", 8)
+            )
+
+        if name == "get_corner_history":
+
+            return corners.team_corners(
+                a["team"],
+                a.get("n", 8)
+            )
+
+        if name == "convert_code":
+
+            out = router.convert_for_chat(
+                a["code"],
+                a.get("source"),
+                a["target"],
+                a.get("allow_partial", False)
+            )
+
+            if "ticket" in out:
+                t[:] = out.pop("ticket")
+                s["slips"] = []
+
+            if "new_code" in out:
+                s["codes"].append(out.pop("new_code"))
+
+            return out
 
         if name == "remove_legs":
-            indices = {int(i) - 1 for i in a.get("indices", []) if int(i) > 0}
-            odds_range = a.get("odds_between")
-            if odds_range and len(odds_range) != 2:
-                return {"error": "odds_between must contain [low, high]."}
-            low, high = (float(odds_range[0]), float(odds_range[1])) if odds_range else (None, None)
-            keep, removed = [], []
-            for i, leg in enumerate(ticket):
-                odds = float(leg.get("odds", 0))
-                if i in indices or (odds_range and low <= odds <= high):
-                    removed.append({"index": i + 1, "selection": _names([leg])[0]})
-                else:
-                    keep.append(leg)
-            state["ticket"] = keep
-            state["slips"] = []
-            return {"removed": removed, "ticket_size": len(keep), "total_odds": _product(keep)}
+
+            idx = {
+                i - 1
+                for i in a.get("indices", [])
+            }
+
+            rng = a.get("odds_between")
+
+            gone = [
+                x for i, x in enumerate(t)
+                if i in idx
+                or (
+                    rng
+                    and rng[0] <= x["odds"] <= rng[1]
+                )
+            ]
+
+            t[:] = [
+                x for i, x in enumerate(t)
+                if i not in idx
+                and not (
+                    rng
+                    and rng[0] <= x["odds"] <= rng[1]
+                )
+            ]
+
+            s["slips"] = []
+
+            return {
+                "removed": len(gone),
+                "ticket_size": len(t),
+                "total_odds": prod(t)
+            }
 
         if name == "split_ticket":
-            if not ticket:
-                return {"error": "There are no selections to split."}
-            parts = int(a["parts"])
-            if parts < 2:
-                return {"error": "Choose at least 2 slips."}
-            if parts > len(ticket):
-                return {"error": f"Cannot split {len(ticket)} selections into {parts} non-empty slips."}
-            groups = [[] for _ in range(parts)]
-            log_totals = [0.0] * parts
-            # Greedy balancing: largest odds first, placing each into the lowest-odds group.
-            for leg in sorted(ticket, key=lambda x: float(x["odds"]), reverse=True):
-                idx = min(range(parts), key=lambda j: (log_totals[j], len(groups[j])))
-                groups[idx].append(leg)
-                log_totals[idx] += math.log(float(leg["odds"]))
-            state["slips"] = groups
+
+            n = max(2, int(a["parts"]))
+            cap = math.ceil(len(t) / n)
+
+            groups = [[] for _ in range(n)]
+            logs = [0.0] * n
+
+            for x in sorted(
+                t,
+                key=lambda x: -x["odds"]
+            ):
+
+                i = min(
+                    (
+                        j for j in range(n)
+                        if len(groups[j]) < cap
+                    ),
+                    key=lambda j: logs[j]
+                )
+
+                groups[i].append(x)
+                logs[i] += math.log(x["odds"])
+
+            s["slips"] = groups
+
             return [
-                {"slip": i + 1, "games": len(g), "odds": _product(g), "selections": _names(g)}
+                {
+                    "slip": i + 1,
+                    "games": len(g),
+                    "odds": prod(g)
+                }
                 for i, g in enumerate(groups)
             ]
 
-        if name == "get_team_stat_history":
-            return sportapi.team_history(a["team_id"], a["league_id"], a.get("n", 8))
-
-        if name == "get_corner_history":
-            return corners.team_corners(a["team"], a.get("n", 8))
-
-        if name == "convert_code":
-            result = router.convert_for_chat(
-                a["code"], a.get("source"), a["target"], bool(a.get("allow_partial", False))
-            )
-            if isinstance(result, dict) and "ticket" in result:
-                state["ticket"] = list(result.pop("ticket") or [])
-                state["slips"] = []
-            if isinstance(result, dict) and result.get("new_code"):
-                state["codes"].append(result["new_code"])
-            return result
-
-        if name == "clear_ticket":
-            state["ticket"] = []
-            state["slips"] = []
-            return {"status": "cleared"}
-
         if name == "book_ticket":
-            if not booking_approved:
-                return {
-                    "error": "Booking-code generation requires the user's explicit approval in the current message. Show the ticket and ask for approval."
+
+            out = []
+
+            for g in (s["slips"] or [t]):
+
+                if not g:
+                    continue
+
+                r = sportybet.book(g)
+
+                item = {
+                    "code": r["code"],
+                    "games": len(g),
+                    "odds": round(
+                        r.get("total_odds") or prod(g),
+                        2
+                    )
                 }
-            groups = state["slips"] or ([ticket] if ticket else [])
-            if not groups:
-                return {"error": "The ticket is empty. Add selections first."}
-            created = []
-            for group in groups:
-                result = sportybet.book(group)
-                if not isinstance(result, dict) or not result.get("code"):
-                    return {
-                        "error": "SportyBet did not return a confirmed booking code. No code has been recorded.",
-                        "partial_codes_created": created,
-                    }
-                created.append({
-                    "code": result["code"],
-                    "games": len(group),
-                    "odds": round(float(result.get("total_odds") or _product(group)), 2),
-                })
-            state["codes"].extend(created)
-            return {"status": "created", "booking_codes": created}
+
+                out.append(item)
+                s["codes"].append(item)
+
+            return out
+
+        if name == "convert_ticket" and a["platform"] == "msport":
+
+            r = msport.create_msport_code(t)
+
+            item = {
+                "code": r["code"],
+                "games": r["sent"],
+                "odds": prod(t)
+            }
+
+            s["codes"].append(item)
+
+            return r
 
         if name == "convert_ticket":
-            platform = str(a["platform"]).lower()
-            if not ticket:
-                return {"error": "The ticket is empty."}
-            if platform == "msport":
-                result = msport.create_msport_code(ticket)
-                if not isinstance(result, dict) or not result.get("code"):
-                    return {"error": "MSport did not return a confirmed code.", "details": result}
-                code_item = {"code": result["code"], "games": result.get("sent", len(ticket)), "odds": _product(ticket)}
-                state["codes"].append(code_item)
-                return result
+
+            lines = [
+                (
+                    f'{x["home"]} v {x["away"]} | '
+                    f'{x["market"]}: {x["pick"]} @ {x["odds"]}'
+                )
+                for x in t
+            ]
+
             return {
-                "platform": platform,
+                "platform": a["platform"],
                 "status": "manual_slip",
-                "slip": _names(ticket),
-                "note": "No live code-generation adapter is connected for this bookmaker. This is not a booking code.",
+                "slip": lines,
+                "note": (
+                    "No live adapter for this platform yet. "
+                    "Market names may differ; match each line by hand."
+                )
             }
 
         return {"error": f"Unknown tool: {name}"}
 
-    except Exception as exc:
-        log.exception("Tool %s failed", name)
-        return {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+    except Exception as e:
+
+        return {
+            "error": f"{type(e).__name__}: {e}"
+        }
 
 
-def _explicit_booking_request(message: str) -> bool:
-    text = message.lower()
-    patterns = (
-        r"\b(book|generate|create)\b.{0,35}\b(code|booking code|slip)\b",
-        r"\b(book|generate|create)\s+(it|this|the ticket|the slip)\b",
-        r"\bbooking code\b",
-    )
-    return any(re.search(pattern, text) for pattern in patterns)
+# =========================================================
+# MISTRAL API
+# =========================================================
 
+def mistral_request(messages, use_tools=True):
+
+    if not MISTRAL_API_KEY:
+
+        raise RuntimeError(
+            "MISTRAL_API_KEY is missing from Render environment variables."
+        )
+
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "max_tokens": 2000,
+        "temperature": 0.2
+    }
+
+    if use_tools:
+
+        payload["tools"] = MISTRAL_TOOLS
+        payload["tool_choice"] = "auto"
+
+    headers = {
+        "Authorization": f"Bearer {MISTRAL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+
+        response = httpx.post(
+            MISTRAL_URL,
+            headers=headers,
+            json=payload,
+            timeout=90
+        )
+
+    except httpx.TimeoutException:
+
+        raise RuntimeError(
+            "Mistral request timed out. Please try again."
+        )
+
+    except httpx.RequestError as e:
+
+        raise RuntimeError(
+            f"Mistral connection error: {e}"
+        )
+
+    if response.status_code >= 400:
+
+        try:
+            error_data = response.json()
+        except Exception:
+            error_data = response.text[:1000]
+
+        raise RuntimeError(
+            f"Mistral HTTP {response.status_code}: {error_data}"
+        )
+
+    data = response.json()
+
+    if not data.get("choices"):
+
+        raise RuntimeError(
+            "Mistral returned an empty response."
+        )
+
+    return data["choices"][0]["message"]
+
+
+# =========================================================
+# CHAT MODEL
+# =========================================================
 
 class Chat(BaseModel):
-    session: str = Field(min_length=1, max_length=100)
-    message: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+    session: str
+    message: str
 
 
-app = FastAPI(title="BetOracle AI", version="1.0.0")
+app = FastAPI()
 
+
+# =========================================================
+# CHAT ENDPOINT
+# =========================================================
 
 @app.post("/api/chat")
 def chat(c: Chat):
-    session_id = c.session.strip()
-    message = c.message.strip()
-    if not session_id or not message:
-        raise HTTPException(status_code=400, detail="Session and message are required.")
 
-    state = get_state(session_id)
-    approved = _explicit_booking_request(message)
+    s = SESSIONS.setdefault(
+        c.session,
+        {
+            "history": [],
+            "ticket": [],
+            "slips": [],
+            "codes": []
+        }
+    )
+
+    msgs = s["history"]
+
+    msgs.append({
+        "role": "user",
+        "content": c.message
+    })
 
     try:
-        reply = agent.chat(
-            state,
-            message,
-            system_text=SYSTEM,
-            tool_specs=TOOLS,
-            run_tool=lambda name, args: run_tool(name, args, state, approved),
-            mutating=MUTATING_TOOLS,
-            signature=lambda current: json.dumps({
-                "ticket": current.get("ticket", []),
-                "slips": current.get("slips", []),
-                "codes": current.get("codes", []),
-            }, sort_keys=True, default=str),
+
+        for step in range(MAX_STEPS):
+
+            r = mistral_request(
+                [
+                    {
+                        "role": "system",
+                        "content": SYSTEM
+                    }
+                ] + msgs,
+                use_tools=True
+            )
+
+            assistant_message = {
+                "role": "assistant",
+                "content": r.get("content"),
+            }
+
+            tool_calls = r.get("tool_calls") or []
+
+            if tool_calls:
+
+                assistant_message["tool_calls"] = tool_calls
+
+            msgs.append(assistant_message)
+
+            if not tool_calls:
+
+                reply = r.get("content") or ""
+
+                break
+
+            for call in tool_calls:
+
+                function = call.get("function", {})
+
+                tool_name = function.get("name")
+
+                raw_args = function.get("arguments", "{}")
+
+                try:
+
+                    if isinstance(raw_args, str):
+                        arguments = json.loads(raw_args)
+                    else:
+                        arguments = raw_args
+
+                    if not isinstance(arguments, dict):
+                        arguments = {}
+
+                except Exception:
+
+                    result = {
+                        "error": "Invalid tool arguments returned by Mistral."
+                    }
+
+                else:
+
+                    result = run_tool(
+                        tool_name,
+                        arguments,
+                        s
+                    )
+
+                msgs.append({
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "content": json.dumps(
+                        result,
+                        default=str
+                    )[:12000]
+                })
+
+        else:
+
+            reply = (
+                "I reached the maximum number of analysis steps. "
+                "Please narrow down your request."
+            )
+
+        # Keep conversation history within limits.
+        if len(msgs) > MAX_HISTORY:
+            del msgs[:-MAX_HISTORY]
+
+        return {
+            "reply": reply,
+            "ticket": s["ticket"],
+            "codes": s["codes"]
+        }
+
+    except Exception as e:
+
+        # Remove the incomplete user turn and tool messages.
+        # Keep the session usable for the next request.
+        if msgs and msgs[-1].get("role") != "assistant":
+            pass
+
+        raise HTTPException(
+            status_code=502,
+            detail=str(e)
         )
-    except agent.AIUnavailable as exc:
-        save_state(session_id, state)
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        log.exception("Chat request failed")
-        save_state(session_id, state)
-        raise HTTPException(status_code=500, detail="BetOracle could not complete this request. Please try again.")
 
-    save_state(session_id, state)
-    return {
-        "reply": reply,
-        "ticket": state["ticket"],
-        "codes": state["codes"],
-    }
 
+# =========================================================
+# OTHER ENDPOINTS
+# =========================================================
 
 @app.get("/api/usage")
 def usage():
-    try:
-        return {"sportapi_calls_today": max(0, count_call() - 1)}
-    except Exception:
-        return {"sportapi_calls_today": None, "note": "Usage counter unavailable."}
+
+    return {
+        "sportapi_calls_today": count_call() - 1
+    }
 
 
 @app.get("/api/bookmakers")
 def bookmaker_status():
-    result = {}
-    for key, value in bookmakers.BOOKMAKERS.items():
-        try:
-            caps = bookmakers.caps(key)
-        except Exception:
-            caps = {"connected": False}
-        result[key] = {"label": value.get("label", key), **caps}
-    return result
+
+    return {
+        k: {
+            "label": v["label"],
+            **bookmakers.caps(k)
+        }
+        for k, v in bookmakers.BOOKMAKERS.items()
+    }
 
 
 @app.get("/health")
 def health():
+
     return {
         "ok": True,
-        "ai": "gemini",
-        "gemini_configured": agent.configured(),
-        "session_storage": "upstash" if UPSTASH_URL and UPSTASH_TOKEN else "memory_only",
+        "ai": "Mistral",
+        "model": MODEL,
+        "api_key_configured": bool(MISTRAL_API_KEY)
     }
 
 
-static_dir = Path(__file__).resolve().parent / "static"
-if static_dir.is_dir():
-    app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
-else:
-    log.warning("Static directory not found: %s", static_dir)
+# =========================================================
+# FRONTEND
+# =========================================================
+
+app.mount(
+    "/",
+    StaticFiles(
+        directory=os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "static"
+        ),
+        html=True
+    )
+)
+
+# Run locally:
+# uvicorn app:app --reload
