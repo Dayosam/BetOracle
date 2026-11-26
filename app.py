@@ -1,7 +1,9 @@
 import os
 import json
 import math
+import re
 import time
+import threading
 import traceback
 import httpx
 
@@ -33,8 +35,13 @@ MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 MAX_STEPS = int(os.getenv("AI_MAX_STEPS", "12"))
-MAX_HISTORY = int(os.getenv("AI_HISTORY_LIMIT", "20"))
-TOOL_RESULT_LIMIT = int(os.getenv("AI_TOOL_RESULT_LIMIT", "3500"))
+MAX_HISTORY = int(os.getenv("AI_HISTORY_LIMIT", "12"))
+TOOL_RESULT_LIMIT = int(os.getenv("AI_TOOL_RESULT_LIMIT", "2500"))
+
+# Groq free tier allows 8000 tokens per minute for gpt-oss-20b.
+# Stay under it so requests wait instead of failing.
+TPM_LIMIT = int(os.getenv("GROQ_TPM_LIMIT", "7200"))
+MAX_OUT = int(os.getenv("GROQ_MAX_OUT", "1200"))
 
 PLATFORMS = list(bookmakers.BOOKMAKERS)
 
@@ -686,6 +693,51 @@ def run_tool(name, a, s):
 # GROQ API REQUEST (with retries)
 # =========================================================
 
+_usage = []          # (timestamp, tokens) used in the last 60 seconds
+_usage_lock = threading.Lock()
+
+
+def _wait_for_budget(needed):
+    """Sleep until the per-minute token budget has room for this request."""
+
+    waited = 0.0
+
+    while waited < 70:
+
+        now = time.time()
+
+        with _usage_lock:
+
+            _usage[:] = [(t, n) for t, n in _usage if now - t < 60]
+            used = sum(n for _, n in _usage)
+
+            if not _usage or used + needed <= TPM_LIMIT:
+                return
+
+            pause = 60 - (now - _usage[0][0]) + 0.5
+
+        pause = min(max(pause, 1.0), 15.0)
+        time.sleep(pause)
+        waited += pause
+
+
+def _record_usage(tokens):
+
+    with _usage_lock:
+        _usage.append((time.time(), int(tokens)))
+
+
+def _retry_seconds(text, default=5.0):
+    """Parse 'Please try again in 1m2.5s' / '1.28s' from Groq's message."""
+
+    m = re.search(r"try again in (?:(\d+)m)?([\d.]+)s", text or "")
+
+    if not m:
+        return default
+
+    return int(m.group(1) or 0) * 60 + float(m.group(2)) + 0.5
+
+
 def groq_request(messages, use_tools=True):
 
     if not GROQ_API_KEY:
@@ -696,9 +748,13 @@ def groq_request(messages, use_tools=True):
     payload = {
         "model": MODEL,
         "messages": messages,
-        "max_completion_tokens": 2000,
+        "max_completion_tokens": MAX_OUT,
         "temperature": 0.2
     }
+
+    # gpt-oss is a reasoning model: low effort saves a lot of tokens
+    if MODEL.startswith("openai/gpt-oss"):
+        payload["reasoning_effort"] = "low"
 
     if use_tools:
         payload["tools"] = GROQ_TOOLS
@@ -710,9 +766,13 @@ def groq_request(messages, use_tools=True):
         "Content-Type": "application/json"
     }
 
+    estimate = len(json.dumps(payload, default=str)) // 3 + MAX_OUT
+
     last_error = ""
 
-    for attempt in range(4):
+    for attempt in range(6):
+
+        _wait_for_budget(estimate)
 
         try:
 
@@ -731,16 +791,17 @@ def groq_request(messages, use_tools=True):
             last_error = f"Groq connection error: {e}"
             continue
 
-        # Rate limited: wait, then retry
+        # Rate limited: wait exactly as long as Groq says, then retry
         if response.status_code == 429:
 
-            try:
-                wait = float(response.headers.get("retry-after", 5))
-            except ValueError:
-                wait = 5
-
             last_error = f"Groq rate limit: {response.text[:300]}"
-            time.sleep(min(wait, 20))
+
+            wait = _retry_seconds(response.text)
+
+            # assume the window is nearly full so the limiter waits too
+            _record_usage(TPM_LIMIT // 2)
+
+            time.sleep(min(wait, 25))
             continue
 
         # Model produced a malformed tool call: retry
@@ -756,6 +817,9 @@ def groq_request(messages, use_tools=True):
             )
 
         data = response.json()
+
+        used = (data.get("usage") or {}).get("total_tokens")
+        _record_usage(used if used else estimate)
 
         if not data.get("choices"):
             last_error = "Groq returned an empty response."
