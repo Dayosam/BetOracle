@@ -25,10 +25,10 @@ from cache import cached, count_call
 
 load_dotenv()
 
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
-MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
-MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 MAX_STEPS = int(os.getenv("AI_MAX_STEPS", "12"))
 MAX_HISTORY = int(os.getenv("AI_HISTORY_LIMIT", "30"))
@@ -327,10 +327,10 @@ TOOLS = [
 
 
 # =========================================================
-# MISTRAL TOOL FORMAT
+# GROQ TOOL FORMAT
 # =========================================================
 
-MISTRAL_TOOLS = [
+GROQ_TOOLS = [
     {
         "type": "function",
         "function": {
@@ -643,36 +643,37 @@ def run_tool(name, a, s):
 
 
 # =========================================================
-# MISTRAL API REQUEST
+# GROQ API REQUEST
 # =========================================================
 
-def mistral_request(messages, use_tools=True):
+def groq_request(messages, use_tools=True):
 
-    if not MISTRAL_API_KEY:
+    if not GROQ_API_KEY:
         raise RuntimeError(
-            "MISTRAL_API_KEY is missing from Render environment variables."
+            "GROQ_API_KEY is missing from Render environment variables."
         )
 
     payload = {
         "model": MODEL,
         "messages": messages,
-        "max_tokens": 2000,
+        "max_completion_tokens": 2000,
         "temperature": 0.2
     }
 
     if use_tools:
-        payload["tools"] = MISTRAL_TOOLS
+        payload["tools"] = GROQ_TOOLS
         payload["tool_choice"] = "auto"
+        payload["parallel_tool_calls"] = False
 
     headers = {
-        "Authorization": f"Bearer {MISTRAL_API_KEY}",
+        "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
 
     try:
 
         response = httpx.post(
-            MISTRAL_URL,
+            GROQ_URL,
             headers=headers,
             json=payload,
             timeout=90
@@ -680,12 +681,12 @@ def mistral_request(messages, use_tools=True):
 
     except httpx.TimeoutException:
         raise RuntimeError(
-            "Mistral request timed out. Please try again."
+            "Groq request timed out. Please try again."
         )
 
     except httpx.RequestError as e:
         raise RuntimeError(
-            f"Mistral connection error: {e}"
+            f"Groq connection error: {e}"
         )
 
     if response.status_code >= 400:
@@ -696,14 +697,14 @@ def mistral_request(messages, use_tools=True):
             error_data = response.text[:1000]
 
         raise RuntimeError(
-            f"Mistral HTTP {response.status_code}: {error_data}"
+            f"Groq HTTP {response.status_code}: {error_data}"
         )
 
     data = response.json()
 
     if not data.get("choices"):
         raise RuntimeError(
-            "Mistral returned an empty response."
+            "Groq returned an empty response."
         )
 
     return data["choices"][0]["message"]
@@ -722,19 +723,19 @@ app = FastAPI()
 
 
 # =========================================================
-# MISTRAL DIRECT TEST
+# GROQ DIRECT TEST
 # =========================================================
 
-@app.get("/api/test-mistral")
-def test_mistral():
+@app.get("/api/test-groq")
+def test_groq():
 
     try:
 
-        result = mistral_request(
+        result = groq_request(
             [
                 {
                     "role": "user",
-                    "content": "Reply with: Mistral is working."
+                    "content": "Reply with: Groq is working."
                 }
             ],
             use_tools=False
@@ -774,8 +775,6 @@ def chat(c: Chat):
 
     msgs = s["history"]
 
-    # Remember the previous history length so a failed
-    # request can be rolled back safely.
     previous_length = len(msgs)
 
     msgs.append({
@@ -789,7 +788,7 @@ def chat(c: Chat):
 
         for step in range(MAX_STEPS):
 
-            r = mistral_request(
+            r = groq_request(
                 [
                     {
                         "role": "system",
@@ -862,7 +861,6 @@ def chat(c: Chat):
                 "Please narrow down your request."
             )
 
-        # Keep the most recent conversation messages.
         if len(msgs) > MAX_HISTORY:
             del msgs[:-MAX_HISTORY]
 
@@ -874,7 +872,6 @@ def chat(c: Chat):
 
     except Exception as e:
 
-        # Roll back incomplete conversation history.
         del msgs[previous_length:]
 
         raise HTTPException(
@@ -920,9 +917,9 @@ def health():
 
     return {
         "ok": True,
-        "ai": "Mistral",
+        "ai": "Groq",
         "model": MODEL,
-        "api_key_configured": bool(MISTRAL_API_KEY)
+        "api_key_configured": bool(GROQ_API_KEY)
     }
 
 
