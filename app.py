@@ -7,7 +7,7 @@ import threading
 import traceback
 import httpx
 
-from datetime import date
+from datetime import date, timedelta
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -19,6 +19,7 @@ import corners
 import bookmakers
 import msport
 import convert_router as router
+import prediction_engine
 
 from cache import cached, count_call
 
@@ -38,14 +39,82 @@ MAX_STEPS = int(os.getenv("AI_MAX_STEPS", "12"))
 MAX_HISTORY = int(os.getenv("AI_HISTORY_LIMIT", "12"))
 TOOL_RESULT_LIMIT = int(os.getenv("AI_TOOL_RESULT_LIMIT", "2500"))
 
-# Groq free tier allows 8000 tokens per minute for gpt-oss-20b.
-# Stay under it so requests wait instead of failing.
 TPM_LIMIT = int(os.getenv("GROQ_TPM_LIMIT", "7200"))
 MAX_OUT = int(os.getenv("GROQ_MAX_OUT", "1200"))
 
 PLATFORMS = list(bookmakers.BOOKMAKERS)
 
 SESSIONS = {}
+
+
+# =========================================================
+# PREDICTION REQUEST DETECTION
+# =========================================================
+
+def detect_prediction_request(message):
+
+    text = message.lower().strip()
+
+    # Requests that must remain in normal chat.
+    excluded = [
+        "why did you choose",
+        "why did you select",
+        "explain your prediction",
+        "explain this pick",
+        "analyse this",
+        "analyze this",
+        "convert",
+        "booking code",
+        "book this ticket",
+        "book my ticket",
+        "remove",
+        "replace",
+        "clear my ticket",
+        "edit my ticket",
+        "change my ticket",
+        "what does this mean",
+        "how does this work"
+    ]
+
+    if any(word in text for word in excluded):
+        return None
+
+    patterns = [
+        r"(?:give me|get me|find|show me|generate)\s+(\d+)\s+(?:best\s+)?(?:predictions|picks|tips|odds)",
+        r"(?:best|strongest)\s+(\d+)\s+(?:predictions|picks|tips)",
+        r"(\d+)\s+(?:best\s+)?(?:predictions|picks|tips)\s+(?:for|from|tonight|today)"
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(pattern, text)
+
+        if match:
+
+            return {
+                "count": min(int(match.group(1)), 20),
+                "league": None
+            }
+
+    # Requests without a specified number.
+    general_requests = [
+        "give me predictions",
+        "best predictions",
+        "strongest picks",
+        "today's predictions",
+        "tonight's predictions",
+        "give me your best picks",
+        "find the best picks"
+    ]
+
+    if any(term in text for term in general_requests):
+
+        return {
+            "count": 2,
+            "league": None
+        }
+
+    return None
 
 
 # =========================================================
@@ -60,15 +129,19 @@ Talk like a normal person, short and direct.
 
 Follow the user's instructions exactly.
 
-For example, "book me weekend matches" means:
-get_fixtures for Saturday and Sunday, get_markets and get_stats, add_to_ticket, then book_ticket.
+IMPORTANT BOOKING RULES:
 
-If the user does not name a match, do not keep asking questions.
-Look at upcoming fixtures with get_fixtures, choose the best-supported matches yourself,
-and go ahead. If the user names a league (for example "Europa League"), use it as the league filter.
+Generating predictions does not mean the user wants a ticket created.
 
-Be efficient with tools: for a small request such as "2 best odds", look at no more than
-4 candidate matches, then pick 2. Do not call tools you do not need.
+Adding selections to a ticket requires the user's request.
+
+Creating a SportyBet booking code requires an explicit booking request.
+
+Booking creates a booking code only. You never place real-money bets.
+
+You must never automatically book predictions.
+
+For ordinary prediction requests, the Python prediction engine handles the request.
 
 RULES:
 
@@ -84,7 +157,7 @@ Its reason MUST give the real numbers:
 - Head-to-head.
 - Explain how the evidence supports the exact market.
 
-If a sport or market has no statistics source, say plainly that the pick rests on odds only.
+If a sport or market has no statistics source, say plainly if the pick rests on odds only.
 
 Any market on SportyBet is allowed:
 corners, fouls, shots, tackles, cards, player props, basketball, darts, tennis and more.
@@ -94,16 +167,12 @@ gather real odds with get_markets for each sport, pick the best-supported select
 
 If odds are unavailable for a sport, say so. Never fill the gap with guessed odds.
 
-Booking creates a booking code only. You never place real-money bets.
-
-No pick is guaranteed.
-
 You can edit tickets on request:
 - Remove legs by number or odds range.
 - Replace legs.
 - Convert every leg to another market.
 - Split into N slips with split_ticket.
-- Book each with book_ticket.
+- Book each with book_ticket when explicitly requested.
 
 When the user gives a target total odds, keep the total within a few percent of it after every edit and state the final total.
 
@@ -322,7 +391,7 @@ TOOLS = [
     },
     {
         "name": "book_ticket",
-        "description": "Book the ticket on SportyBet and return booking codes.",
+        "description": "Book the ticket on SportyBet and return booking codes. Use only after an explicit booking request.",
         "input_schema": {
             "type": "object",
             "properties": {}
@@ -367,14 +436,20 @@ GROQ_TOOLS = [
 # =========================================================
 
 def names(legs):
+
     return [
-        f'{x["home"]} v {x["away"]}: {x["market"]} {x["pick"]} @ {x["odds"]}'
+        f'{x["home"]} v {x["away"]}: '
+        f'{x["market"]} {x["pick"]} @ {x["odds"]}'
         for x in legs
     ]
 
 
 def prod(legs):
-    return round(math.prod(x["odds"] for x in legs), 2)
+
+    return round(
+        math.prod(x["odds"] for x in legs),
+        2
+    )
 
 
 # =========================================================
@@ -382,9 +457,12 @@ def prod(legs):
 # =========================================================
 
 def compact(result, limit=TOOL_RESULT_LIMIT):
-    """Serialise a tool result and cap its size to save tokens."""
 
-    text = json.dumps(result, default=str, separators=(",", ":"))
+    text = json.dumps(
+        result,
+        default=str,
+        separators=(",", ":")
+    )
 
     if len(text) > limit:
         text = text[:limit] + '..."[truncated]"'
@@ -393,7 +471,6 @@ def compact(result, limit=TOOL_RESULT_LIMIT):
 
 
 def trim_history(msgs):
-    """Keep history short, and never start it with a tool/assistant fragment."""
 
     if len(msgs) > MAX_HISTORY:
         del msgs[:-MAX_HISTORY]
@@ -506,7 +583,9 @@ def run_tool(name, a, s):
 
             t.extend(a["selections"])
 
-            return {"ticket_size": len(t)}
+            return {
+                "ticket_size": len(t)
+            }
 
         if name == "clear_ticket":
 
@@ -544,7 +623,9 @@ def run_tool(name, a, s):
                 s["slips"] = []
 
             if "new_code" in out:
-                s["codes"].append(out.pop("new_code"))
+                s["codes"].append(
+                    out.pop("new_code")
+                )
 
             return out
 
@@ -642,7 +723,9 @@ def run_tool(name, a, s):
                 s["codes"].append(item)
 
             if not out:
-                return {"error": "The ticket is empty. Add selections first."}
+                return {
+                    "error": "The ticket is empty. Add selections first."
+                }
 
             return out
 
@@ -680,7 +763,9 @@ def run_tool(name, a, s):
                 )
             }
 
-        return {"error": f"Unknown tool: {name}"}
+        return {
+            "error": f"Unknown tool: {name}"
+        }
 
     except Exception as e:
 
@@ -690,15 +775,14 @@ def run_tool(name, a, s):
 
 
 # =========================================================
-# GROQ API REQUEST (with retries)
+# GROQ API REQUEST
 # =========================================================
 
-_usage = []          # (timestamp, tokens) used in the last 60 seconds
+_usage = []
 _usage_lock = threading.Lock()
 
 
 def _wait_for_budget(needed):
-    """Sleep until the per-minute token budget has room for this request."""
 
     waited = 0.0
 
@@ -708,15 +792,28 @@ def _wait_for_budget(needed):
 
         with _usage_lock:
 
-            _usage[:] = [(t, n) for t, n in _usage if now - t < 60]
-            used = sum(n for _, n in _usage)
+            _usage[:] = [
+                (t, n)
+                for t, n in _usage
+                if now - t < 60
+            ]
+
+            used = sum(
+                n for _, n in _usage
+            )
 
             if not _usage or used + needed <= TPM_LIMIT:
                 return
 
-            pause = 60 - (now - _usage[0][0]) + 0.5
+            pause = (
+                60 - (now - _usage[0][0]) + 0.5
+            )
 
-        pause = min(max(pause, 1.0), 15.0)
+        pause = min(
+            max(pause, 1.0),
+            15.0
+        )
+
         time.sleep(pause)
         waited += pause
 
@@ -724,23 +821,32 @@ def _wait_for_budget(needed):
 def _record_usage(tokens):
 
     with _usage_lock:
-        _usage.append((time.time(), int(tokens)))
+        _usage.append(
+            (time.time(), int(tokens))
+        )
 
 
 def _retry_seconds(text, default=5.0):
-    """Parse 'Please try again in 1m2.5s' / '1.28s' from Groq's message."""
 
-    m = re.search(r"try again in (?:(\d+)m)?([\d.]+)s", text or "")
+    match = re.search(
+        r"try again in (?:(\d+)m)?([\d.]+)s",
+        text or ""
+    )
 
-    if not m:
+    if not match:
         return default
 
-    return int(m.group(1) or 0) * 60 + float(m.group(2)) + 0.5
+    return (
+        int(match.group(1) or 0) * 60
+        + float(match.group(2))
+        + 0.5
+    )
 
 
 def groq_request(messages, use_tools=True):
 
     if not GROQ_API_KEY:
+
         raise RuntimeError(
             "GROQ_API_KEY is missing from Render environment variables."
         )
@@ -752,11 +858,11 @@ def groq_request(messages, use_tools=True):
         "temperature": 0.2
     }
 
-    # gpt-oss is a reasoning model: low effort saves a lot of tokens
     if MODEL.startswith("openai/gpt-oss"):
         payload["reasoning_effort"] = "low"
 
     if use_tools:
+
         payload["tools"] = GROQ_TOOLS
         payload["tool_choice"] = "auto"
         payload["parallel_tool_calls"] = False
@@ -766,7 +872,10 @@ def groq_request(messages, use_tools=True):
         "Content-Type": "application/json"
     }
 
-    estimate = len(json.dumps(payload, default=str)) // 3 + MAX_OUT
+    estimate = (
+        len(json.dumps(payload, default=str)) // 3
+        + MAX_OUT
+    )
 
     last_error = ""
 
@@ -784,50 +893,66 @@ def groq_request(messages, use_tools=True):
             )
 
         except httpx.TimeoutException:
+
             last_error = "Groq request timed out."
             continue
 
         except httpx.RequestError as e:
+
             last_error = f"Groq connection error: {e}"
             continue
 
-        # Rate limited: wait exactly as long as Groq says, then retry
         if response.status_code == 429:
 
-            last_error = f"Groq rate limit: {response.text[:300]}"
+            last_error = (
+                f"Groq rate limit: {response.text[:300]}"
+            )
 
             wait = _retry_seconds(response.text)
 
-            # assume the window is nearly full so the limiter waits too
             _record_usage(TPM_LIMIT // 2)
 
             time.sleep(min(wait, 25))
             continue
 
-        # Model produced a malformed tool call: retry
-        if response.status_code == 400 and "tool_use_failed" in response.text:
+        if (
+            response.status_code == 400
+            and "tool_use_failed" in response.text
+        ):
 
-            last_error = f"Groq tool_use_failed: {response.text[:300]}"
+            last_error = (
+                f"Groq tool_use_failed: {response.text[:300]}"
+            )
+
             continue
 
         if response.status_code >= 400:
 
             raise RuntimeError(
-                f"Groq HTTP {response.status_code}: {response.text[:800]}"
+                f"Groq HTTP {response.status_code}: "
+                f"{response.text[:800]}"
             )
 
         data = response.json()
 
-        used = (data.get("usage") or {}).get("total_tokens")
-        _record_usage(used if used else estimate)
+        used = (
+            data.get("usage") or {}
+        ).get("total_tokens")
+
+        _record_usage(
+            used if used else estimate
+        )
 
         if not data.get("choices"):
+
             last_error = "Groq returned an empty response."
             continue
 
         return data["choices"][0]["message"]
 
-    raise RuntimeError(last_error or "Groq failed after retries.")
+    raise RuntimeError(
+        last_error or "Groq failed after retries."
+    )
 
 
 # =========================================================
@@ -835,6 +960,7 @@ def groq_request(messages, use_tools=True):
 # =========================================================
 
 class Chat(BaseModel):
+
     session: str
     message: str
 
@@ -877,7 +1003,7 @@ def test_groq():
 
 
 # =========================================================
-# CHAT ENDPOINT
+# CHAT ENDPOINT — HYBRID ROUTING
 # =========================================================
 
 @app.post("/api/chat")
@@ -894,22 +1020,59 @@ def chat(c: Chat):
     )
 
     msgs = s["history"]
-
     previous_length = len(msgs)
 
-    msgs.append({
-        "role": "user",
-        "content": c.message
-    })
-
     try:
+
+        # -------------------------------------------------
+        # 1. CHECK WHETHER THIS IS A PREDICTION REQUEST
+        # -------------------------------------------------
+
+        prediction_request = detect_prediction_request(
+            c.message
+        )
+
+        if prediction_request:
+
+            result = prediction_engine.predict(
+                sportapi_module=sportapi,
+                sportybet_module=sportybet,
+                count=prediction_request["count"],
+                league=prediction_request["league"]
+            )
+
+            # Predictions are returned separately.
+            # They are NOT automatically added to the ticket.
+            # No booking code is generated here.
+
+            return {
+                "reply": result["reply"],
+                "ticket": s["ticket"],
+                "codes": s["codes"],
+                "predictions": result["ticket"],
+                "booking_created": False
+            }
+
+        # -------------------------------------------------
+        # 2. NORMAL CHAT GOES TO GROQ
+        # -------------------------------------------------
+
+        msgs.append({
+            "role": "user",
+            "content": c.message
+        })
 
         reply = ""
 
         for step in range(MAX_STEPS):
 
             r = groq_request(
-                [{"role": "system", "content": SYSTEM}] + msgs
+                [
+                    {
+                        "role": "system",
+                        "content": SYSTEM
+                    }
+                ] + msgs
             )
 
             assistant_message = {
@@ -920,13 +1083,17 @@ def chat(c: Chat):
             tool_calls = r.get("tool_calls") or []
 
             if tool_calls:
+
                 assistant_message["tool_calls"] = tool_calls
 
             msgs.append(assistant_message)
 
             if not tool_calls:
 
-                reply = (r.get("content") or "").strip()
+                reply = (
+                    r.get("content") or ""
+                ).strip()
+
                 break
 
             for call in tool_calls:
@@ -935,13 +1102,18 @@ def chat(c: Chat):
 
                 tool_name = function.get("name")
 
-                raw_args = function.get("arguments") or "{}"
+                raw_args = (
+                    function.get("arguments") or "{}"
+                )
 
                 try:
 
                     if isinstance(raw_args, str):
+
                         arguments = json.loads(raw_args)
+
                     else:
+
                         arguments = raw_args
 
                     if not isinstance(arguments, dict):
@@ -965,26 +1137,35 @@ def chat(c: Chat):
                     "content": compact(result)
                 })
 
-        # The model returned no text, or ran out of steps:
-        # force a plain-text answer with no tools.
+        # -------------------------------------------------
+        # 3. FORCE A FINAL TEXT RESPONSE IF NECESSARY
+        # -------------------------------------------------
+
         if not reply:
 
             msgs.append({
                 "role": "user",
                 "content": (
-                    "Now reply to me in plain text. Start with the "
-                    "booking code if one exists, then list the picks "
-                    "with odds and the stats reason for each. "
-                    "If something failed, say exactly what."
+                    "Now reply in plain text. Include booking codes "
+                    "only if a booking tool actually created one. "
+                    "List the picks, odds and available statistics. "
+                    "Explain any failed operations."
                 )
             })
 
             final = groq_request(
-                [{"role": "system", "content": SYSTEM}] + msgs,
+                [
+                    {
+                        "role": "system",
+                        "content": SYSTEM
+                    }
+                ] + msgs,
                 use_tools=False
             )
 
-            reply = (final.get("content") or "").strip()
+            reply = (
+                final.get("content") or ""
+            ).strip()
 
             msgs.append({
                 "role": "assistant",
@@ -992,9 +1173,9 @@ def chat(c: Chat):
             })
 
         if not reply:
+
             reply = (
-                "I couldn't finish that. Try a more specific request, "
-                "for example: 'Give me 2 odds from Europa League tonight'."
+                "I couldn't finish that. Try a more specific request."
             )
 
         trim_history(msgs)
@@ -1008,6 +1189,7 @@ def chat(c: Chat):
     except Exception as e:
 
         traceback.print_exc()
+
         print("CHAT ERROR:", e)
 
         del msgs[previous_length:]
@@ -1038,11 +1220,11 @@ def usage():
 def bookmaker_status():
 
     return {
-        k: {
-            "label": v["label"],
-            **bookmakers.caps(k)
+        key: {
+            "label": value["label"],
+            **bookmakers.caps(key)
         }
-        for k, v in bookmakers.BOOKMAKERS.items()
+        for key, value in bookmakers.BOOKMAKERS.items()
     }
 
 
@@ -1055,8 +1237,10 @@ def health():
 
     return {
         "ok": True,
-        "ai": "Groq",
+        "ai": "Hybrid",
         "model": MODEL,
+        "chat_engine": "Groq",
+        "prediction_engine": "Python",
         "api_key_configured": bool(GROQ_API_KEY)
     }
 
@@ -1077,5 +1261,8 @@ app.mount(
 )
 
 
-# Run locally:
+# =========================================================
+# RUN LOCALLY
+# =========================================================
+
 # uvicorn app:app --reload
