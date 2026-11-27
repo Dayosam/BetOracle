@@ -12,7 +12,7 @@ import traceback
 import unicodedata
 
 from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -33,7 +33,9 @@ from cache import count_call
 
 load_dotenv()
 
-MAX_ANALYSE = int(os.getenv("MAX_ANALYSE", "40"))   # max matches to analyse per request
+MAX_ANALYSE = int(os.getenv("MAX_ANALYSE", "24"))   # max matches to analyse per request
+FORM_BUDGET = float(os.getenv("FORM_BUDGET", "40"))     # seconds allowed for loading team stats
+MARKET_BUDGET = float(os.getenv("MARKET_BUDGET", "25")) # seconds allowed for SportyBet odds lookups
 FORM_N = 10                                         # last N finished matches per team
 MIN_FORM = 6                                        # need at least this many matches of data
 
@@ -252,21 +254,25 @@ def team_form(f, side):
     tid = f[f"{side}_id"]
     name = f[f"{side}_team"]
 
-    slugs = []
-    for s in (f.get(f"{side}_slug"), lookup_slug(f, tid), slugify(name)):
-        if s and s not in slugs:
-            slugs.append(s)
+    def fetch_results(s):
+        try:
+            return sportapi.get(f"/teams/slug/{s}", sportapi.H6).get("results", [])
+        except Exception:
+            return []
 
     res, slug = [], None
 
-    for s in slugs:
-        try:
-            res = sportapi.get(f"/teams/slug/{s}", sportapi.H6).get("results", [])
-        except Exception:
-            res = []
+    for s in dict.fromkeys(x for x in (f.get(f"{side}_slug"), slugify(name)) if x):
+        res = fetch_results(s)
         if res:
             slug = s
             break
+
+    if not res:
+        s = lookup_slug(f, tid)
+        if s:
+            res = fetch_results(s)
+            slug = s if res else None
 
     if not res:
         return None
@@ -313,6 +319,9 @@ def team_form(f, side):
 
 
 def load_forms(fixtures):
+    """Load team form in parallel, but never longer than FORM_BUDGET seconds.
+    Returns (forms, unfinished_team_count)."""
+
     tasks = {}
 
     for f in fixtures:
@@ -327,8 +336,24 @@ def load_forms(fixtures):
             print("FORM ERROR:", f.get(f"{side}_team"), type(e).__name__, e)
             return tid, None
 
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        return dict(ex.map(work, tasks.items()))
+    ex = ThreadPoolExecutor(max_workers=8)
+    futs = [ex.submit(work, item) for item in tasks.items()]
+
+    done, pending = wait(futs, timeout=FORM_BUDGET)
+
+    # let slow requests finish in the background (they fill the cache for next time)
+    ex.shutdown(wait=False, cancel_futures=True)
+
+    forms = {}
+
+    for fu in done:
+        try:
+            tid, form = fu.result()
+            forms[tid] = form
+        except Exception:
+            pass
+
+    return forms, len(pending)
 
 
 # =========================================================
@@ -583,7 +608,7 @@ def build_ticket(t, s):
     total_found = len(fixtures)
     fixtures = fixtures[:MAX_ANALYSE]
 
-    forms = load_forms(fixtures)
+    forms, unfinished = load_forms(fixtures)
 
     cands, no_data = [], 0
 
@@ -608,8 +633,21 @@ def build_ticket(t, s):
     # look up real SportyBet odds for the best candidates (in parallel)
     top = cands[: (count + 4) if count else 15]
 
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        looked = list(ex.map(lookup_leg, top))
+    ex = ThreadPoolExecutor(max_workers=5)
+    futs = [ex.submit(lookup_leg, c) for c in top]
+    done, pending = wait(futs, timeout=MARKET_BUDGET)
+    ex.shutdown(wait=False, cancel_futures=True)
+
+    looked = []
+
+    for c, fu in zip(top, futs):
+        if fu in done:
+            try:
+                looked.append(fu.result())
+            except Exception as e:
+                looked.append((c, None, f"error ({type(e).__name__})"))
+        else:
+            looked.append((c, None, "SportyBet was too slow"))
 
     legs, skipped = [], []
 
@@ -661,6 +699,12 @@ def build_ticket(t, s):
         notes.append(
             f"Total odds are {prod(legs)}, below your {target} target, because not enough "
             f"matches passed the stats check."
+        )
+
+    if unfinished:
+        notes.append(
+            f"The stats server was slow, so {unfinished} teams were not checked in time. "
+            f"Ask again in a minute: what was already loaded is cached, so it will be faster."
         )
 
     notes.append(
