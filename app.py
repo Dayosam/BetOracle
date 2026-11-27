@@ -667,11 +667,23 @@ def build_ticket(t, s):
         legs.append(leg)
 
     if not legs:
+        picks = []
+        for i, c in enumerate(cands[: (count or 8)], 1):
+            f = c["f"]
+            picks.append(
+                f"{i}. {f['home_team']} vs {f['away_team']}\n"
+                f"   {f.get('league_name', '')} · {kick_time(f)}\n"
+                f"   Market: {MARKETS[c['key']]['label']}\n"
+                f"   {reason_text(c['key'], f, c['h'], c['a'])}"
+            )
+
         return (
-            "I found strong matches but could not find their markets on SportyBet.\n"
-            + "\n".join(skipped[:5])
-            + "\n\nOpen /api/debug-markets?home=TeamA&away=TeamB on your site and send me "
-              "that output so I can match the market names."
+            "The stats check worked, but SportyBet did not return any odds, so I cannot "
+            "make a booking code right now. These are the matches that passed:\n\n"
+            + "\n\n".join(picks)
+            + "\n\nWhy no code: " + (skipped[0].split(": ", 1)[-1] if skipped else "SportyBet gave no data")
+            + ". If your server log shows \"SPORTYBET ERROR: HTTP 202\", SportyBet is not "
+              "answering requests from this server."
         )
 
     s["ticket"][:] = legs
@@ -955,10 +967,14 @@ def chat(c: Chat):
 def debug_markets(home: str, away: str, search: str = ""):
     """Shows the raw SportyBet market data for a match. Use it to fix market matching."""
 
+    import time as _t
+    t0 = _t.time()
+
     try:
-        return sportybet.get_markets("football", home, away, search or None)
+        data = sportybet.get_markets("football", home, away, search or None)
+        return {"seconds": round(_t.time() - t0, 1), "type": type(data).__name__, "data": data}
     except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
+        return {"seconds": round(_t.time() - t0, 1), "error": f"{type(e).__name__}: {e}"}
 
 
 @app.get("/api/usage")
