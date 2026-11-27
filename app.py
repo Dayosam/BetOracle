@@ -31,6 +31,7 @@ import sportapi
 import bookmakers
 import convert_router as router
 
+import cache
 from cache import count_call
 
 
@@ -1230,9 +1231,29 @@ def debug_markets(home: str, away: str, search: str = ""):
         return {"seconds": round(time.time() - t0, 1), "error": f"{type(e).__name__}: {e}"}
 
 
+def calls_today():
+    """How many real SportAPI calls were made today (read only, does not add to the count)."""
+
+    try:
+        day = time.strftime("calls:%Y-%m-%d", time.gmtime())
+
+        if getattr(cache, "URL", None):
+            return int(cache._redis("GET", day) or 0)
+
+        row = cache._db.execute("select v from c where k=?", (day,)).fetchone()
+        return int(row[0]) if row else 0
+
+    except Exception:
+        return -1
+
+
 @app.get("/api/usage")
 def usage():
-    return {"sportapi_calls_today": count_call() - 1}
+    return {
+        "sportapi_calls_today": calls_today(),
+        "cache": "Upstash Redis (survives restarts)" if getattr(cache, "URL", None)
+                 else "local file (wiped on every Render restart or deploy)",
+    }
 
 
 @app.get("/api/bookmakers")
