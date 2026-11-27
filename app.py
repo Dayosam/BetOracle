@@ -41,7 +41,9 @@ from cache import count_call
 
 load_dotenv()
 
-MAX_ANALYSE = int(os.getenv("MAX_ANALYSE", "16"))        # max matches whose form is checked per request
+MAX_ANALYSE = int(os.getenv("MAX_ANALYSE", "32"))        # most matches whose form is checked per request
+BATCH = int(os.getenv("BATCH", "8"))                     # matches checked per round (it stops once it has enough)
+TOTAL_BUDGET = float(os.getenv("TOTAL_BUDGET", "80"))    # seconds for the whole request
 FORM_BUDGET = float(os.getenv("FORM_BUDGET", "30"))      # seconds allowed for loading team stats
 EVENTS_BUDGET = float(os.getenv("EVENTS_BUDGET", "50"))  # seconds allowed for SportyBet's match list
 MARKET_BUDGET = float(os.getenv("MARKET_BUDGET", "20"))  # seconds allowed for extra SportyBet lookups
@@ -187,7 +189,7 @@ def parse_numbers(t):
         target = float(m.group(1))
 
     m = re.search(
-        r"\b(\d{1,2})\s*(?:best\s*|safe\s*|strong\s*)?"
+        r"\b(\d{1,2})\s+(?:(?!odds?\b)[a-z0-9.+/]+\s+){0,3}?"
         r"(?:matches|match|games|game|picks|pick|legs|leg|teams|selections|fixtures)\b",
         t
     )
@@ -387,7 +389,7 @@ def team_form(f, side):
     }
 
 
-def load_forms(fixtures):
+def load_forms(fixtures, budget=None):
     """Load team form in parallel, but never longer than FORM_BUDGET seconds.
     Returns (forms, unfinished_team_count)."""
 
@@ -408,7 +410,7 @@ def load_forms(fixtures):
     ex = ThreadPoolExecutor(max_workers=8)
     futs = [ex.submit(work, item) for item in tasks.items()]
 
-    done, pending = wait(futs, timeout=FORM_BUDGET)
+    done, pending = wait(futs, timeout=budget or FORM_BUDGET)
 
     # slow requests keep running in the background and fill the memory for next time
     ex.shutdown(wait=False, cancel_futures=True)
@@ -448,20 +450,22 @@ MARKETS = {
 }
 
 
-def score_market(key, h, a):
+def score_market(key, h, a, loose=False):
+    r = 0.1 if loose else 0.0          # how much to relax the thresholds
+
     if key == "gg":
         est = ((h["scored"] + a["conceded"]) / 2) * ((a["scored"] + h["conceded"]) / 2)
         score = 0.5 * est + 0.5 * ((h["btts"] + a["btts"]) / 2)
-        thr = 0.55
-        ok = h["btts"] >= 0.5 and a["btts"] >= 0.5
+        thr = 0.55 - r
+        ok = min(h["btts"], a["btts"]) >= 0.5 - r
     elif key == "over25":
         score = (h["o25"] + a["o25"]) / 2
-        thr = 0.60
-        ok = min(h["o25"], a["o25"]) >= 0.5
+        thr = 0.60 - r
+        ok = min(h["o25"], a["o25"]) >= 0.5 - r
     else:
         score = (h["o15"] + a["o15"]) / 2
-        thr = 0.80
-        ok = min(h["o15"], a["o15"]) >= 0.7
+        thr = 0.80 - r
+        ok = min(h["o15"], a["o15"]) >= 0.7 - r
 
     return {"score": score, "margin": score - thr, "strong": ok and score >= thr}
 
@@ -492,7 +496,7 @@ def reason_text(key, f, h, a):
     )
 
 
-def evaluate(f, h, a, market, ev=None):
+def evaluate(f, h, a, market, ev=None, loose=False):
     """f = display dict (names, league, kickoff). ev = SportyBet event, if known."""
 
     keys = ["gg", "over25", "over15"] if market == "auto" else [market]
@@ -503,7 +507,7 @@ def evaluate(f, h, a, market, ev=None):
         # when we know the SportyBet event, only use markets it actually lists
         if ev is not None and not sportybet.market_pick(ev, k):
             continue
-        r = score_market(k, h, a)
+        r = score_market(k, h, a, loose)
         if best is None or r["margin"] > best["margin"]:
             best = {**r, "key": k}
 
@@ -710,8 +714,8 @@ def sb_window_events(d_from, d_to):
     ]
 
 
-def rank_events(evs, market, k):
-    """Pick the k most promising events using SportyBet's own odds (no SportAPI calls)."""
+def rank_events(evs, market, limit):
+    """Order the events by how promising SportyBet's own odds make them (no SportAPI calls)."""
 
     def odds_of(ev, key):
         p = sportybet.market_pick(ev, key)
@@ -725,15 +729,28 @@ def rank_events(evs, market, k):
         return (o25 + 0.3) if o25 else 99
 
     keys = ["gg", "over25"] if market == "auto" else [market]
-    per = max(4, k // len(keys))
+    lists = [sorted(evs, key=lambda e, k=key: proxy(e, k)) for key in keys]
 
-    chosen = {}
+    out, seen = [], set()
 
-    for key in keys:
-        for ev in sorted(evs, key=lambda e: proxy(e, key))[:per]:
-            chosen[ev["event_id"]] = ev
+    for i in range(max(len(x) for x in lists)):
+        for lst in lists:
+            if i < len(lst) and lst[i]["event_id"] not in seen:
+                seen.add(lst[i]["event_id"])
+                out.append(lst[i])
+        if len(out) >= limit:
+            break
 
-    return list(chosen.values())[:k]
+    return out[:limit]
+
+
+def enough(cands, count, target):
+    if count:
+        return len(cands) >= count + 2
+    if not cands:
+        return False
+    odds = [sportybet.market_pick(c["ev"], c["key"])["odds"] for c in cands]
+    return math.prod(odds) >= target
 
 
 def display_fixture(ev):
@@ -746,14 +763,15 @@ def display_fixture(ev):
 
 
 def build_ticket(t, s):
+    t0 = time.time()
+
     d_from, d_to, when = parse_dates(t)
     market = parse_market(t) or "auto"
     count, target = parse_numbers(t)
+    loose = bool(re.search(r"\b(risky|risk|loose|any|don'?t mind|dont mind)\b", t))
 
     if not count and not target:
         count = 5
-
-    k = min(MAX_ANALYSE, max(8, (count or 5) * 2))
 
     status, sb_msg = warm_sportybet()
 
@@ -764,7 +782,7 @@ def build_ticket(t, s):
         )
 
     if status == "error":
-        return stats_only(t, d_from, d_to, when, market, count, k, sb_msg)
+        return stats_only(t, d_from, d_to, when, market, count, 12, sb_msg)
 
     # ---- 1. SportyBet's own list, no SportAPI calls
     evs = sb_window_events(d_from, d_to)
@@ -781,10 +799,10 @@ def build_ticket(t, s):
         )
 
     total_found = len(evs)
-    chosen = rank_events(evs, market, k)
+    ranked = rank_events(evs, market, MAX_ANALYSE)
 
-    # ---- 2. match them with SportAPI and check form (few calls, all remembered)
-    dates = sorted({datetime.fromtimestamp(e["ms"] / 1000, timezone.utc).date() for e in chosen})
+    # ---- 2. SportAPI fixtures for those days (1 call per day, remembered)
+    dates = sorted({datetime.fromtimestamp(e["ms"] / 1000, timezone.utc).date() for e in ranked})
 
     fixtures = []
     for d in dates:
@@ -795,38 +813,51 @@ def build_ticket(t, s):
                 return f"SportAPI daily limit reached. It resets at 00:00 UTC. ({e})"
             print("FIXTURES ERROR:", d, e, flush=True)
 
-    pairs, no_stats = [], 0
+    # ---- 3. check form in rounds, stop as soon as there are enough strong matches
+    cands, checked, no_stats, unfinished = [], 0, 0, 0
 
-    for ev in chosen:
-        fx = match_fixture(ev, fixtures)
-        if fx:
-            pairs.append((ev, fx))
-        else:
-            no_stats += 1
+    for i in range(0, len(ranked), BATCH):
+        remaining = TOTAL_BUDGET - (time.time() - t0)
 
-    forms, unfinished = load_forms([fx for _, fx in pairs])
+        if i > 0 and remaining < 15:
+            break
 
-    cands = []
+        pairs = []
 
-    for ev, fx in pairs:
-        h, a = forms.get(fx["home_id"]), forms.get(fx["away_id"])
-        if not h or not a:
-            no_stats += 1
-            continue
-        c = evaluate(display_fixture(ev), h, a, market, ev)
-        if c:
-            cands.append(c)
+        for ev in ranked[i:i + BATCH]:
+            fx = match_fixture(ev, fixtures)
+            if fx:
+                pairs.append((ev, fx))
+            else:
+                no_stats += 1
+
+        forms, unf = load_forms([fx for _, fx in pairs], max(8, min(FORM_BUDGET, remaining - 8)))
+        unfinished += unf
+
+        for ev, fx in pairs:
+            h, a = forms.get(fx["home_id"]), forms.get(fx["away_id"])
+            if not h or not a:
+                no_stats += 1
+                continue
+            checked += 1
+            c = evaluate(display_fixture(ev), h, a, market, ev, loose)
+            if c:
+                cands.append(c)
+
+        if enough(cands, count, target):
+            break
 
     cands.sort(key=lambda c: -c["margin"])
 
     if not cands:
         return (
-            f"I checked the form of {len(pairs)} {league_label} matches for {when} "
-            f"(best {len(chosen)} of {total_found} on SportyBet), but none passed the stats check "
-            f"({no_stats} had no usable form data). I would rather give you nothing than weak picks."
+            f"I checked the form of {checked} {league_label} matches for {when} "
+            f"(of {total_found} on SportyBet), but none passed the stats check "
+            f"({no_stats} had no usable form data). I would rather give you nothing than weak picks. "
+            f"Say \"risky\" if you want me to relax the check."
         )
 
-    # ---- 3. build the ticket with the odds from SportyBet's list
+    # ---- 4. build the ticket with the odds from SportyBet's list
     legs, skipped = [], []
     fallback_left = (count or 8) + 3
 
@@ -863,7 +894,7 @@ def build_ticket(t, s):
     s["ticket"][:] = legs
     s["slips"] = []
 
-    # ---- 4. book it
+    # ---- 5. book it
     try:
         item = book_legs(legs, s)
         code_line = f"🎟 BOOKING CODE: {item['code']}\n{item['games']} games · total odds {item['odds']}"
@@ -878,13 +909,13 @@ def build_ticket(t, s):
     if count and len(legs) < count:
         notes.append(
             f"Only {len(legs)} matches passed the stats check, not the {count} you asked for. "
-            f"I left the weak ones out on purpose."
+            f"I left the weak ones out on purpose. Say \"risky\" if you want me to relax the check."
         )
 
     if target and prod(legs) < target * 0.9:
         notes.append(
             f"Total odds are {prod(legs)}, below your {target} target, because not enough "
-            f"matches passed the stats check."
+            f"matches passed the stats check. Say \"risky\" to relax it."
         )
 
     if unfinished:
@@ -894,8 +925,7 @@ def build_ticket(t, s):
         )
 
     notes.append(
-        f"Form checked for {len(pairs)} of the best {len(chosen)} {league_label} matches "
-        f"({total_found} on SportyBet for {when})"
+        f"Checked the form of {checked} {league_label} matches ({total_found} on SportyBet for {when})"
         + (f"; {no_stats} had no form data." if no_stats else ".")
     )
 
