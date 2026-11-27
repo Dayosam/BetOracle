@@ -1,17 +1,24 @@
 """
 BetOracle: no AI, no Groq.
-The server reads what the user types with simple rules, checks real form
-stats from sportapi, picks the strongest matches, books them on SportyBet
-and returns the booking code. It can also read and convert booking codes.
+
+How a request works (built to use as few API calls as possible):
+1. SportyBet's own match list (one cached download, with GG / Over odds included) is
+   filtered by day and league and ranked by those odds. This costs ZERO SportAPI calls.
+2. Only the best ~16 matches get their form checked on SportAPI (2 calls per match,
+   remembered in memory, including failed lookups).
+3. Matches that pass the form check are booked on SportyBet and you get the code.
 """
 
 import os
 import re
 import math
+import time
 import traceback
+import threading
 import unicodedata
 
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from concurrent.futures import ThreadPoolExecutor, wait
 
 from dotenv import load_dotenv
@@ -33,13 +40,14 @@ from cache import count_call
 
 load_dotenv()
 
-MAX_ANALYSE = int(os.getenv("MAX_ANALYSE", "24"))   # max matches to analyse per request
-FORM_BUDGET = float(os.getenv("FORM_BUDGET", "40"))     # seconds allowed for loading team stats
-MARKET_BUDGET = float(os.getenv("MARKET_BUDGET", "25")) # seconds allowed for SportyBet odds lookups
-FORM_N = 10                                         # last N finished matches per team
-MIN_FORM = 6                                        # need at least this many matches of data
+MAX_ANALYSE = int(os.getenv("MAX_ANALYSE", "16"))        # max matches whose form is checked per request
+FORM_BUDGET = float(os.getenv("FORM_BUDGET", "30"))      # seconds allowed for loading team stats
+EVENTS_BUDGET = float(os.getenv("EVENTS_BUDGET", "50"))  # seconds allowed for SportyBet's match list
+MARKET_BUDGET = float(os.getenv("MARKET_BUDGET", "20"))  # seconds allowed for extra SportyBet lookups
+FORM_N = 10                                              # last N finished matches per team
+MIN_FORM = 6                                             # need at least this many matches of data
 
-WAT = timezone(timedelta(hours=1))                  # Nigeria time
+WAT = timezone(timedelta(hours=1))                       # Nigeria time
 
 SESSIONS = {}
 
@@ -61,8 +69,33 @@ def slugify(name):
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
 
 
+def team_norm(name):
+    n = unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode().lower()
+    n = re.sub(r"[^a-z0-9 ]", " ", n)
+    n = re.sub(r"\b(fc|cf|sc|afc|ac|as|fk|sk|club|de|the)\b", " ", n)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+def sim(a, b):
+    return SequenceMatcher(None, team_norm(a), team_norm(b)).ratio()
+
+
 def today():
     return datetime.now(WAT).date()
+
+
+def iso_from_ms(ms):
+    return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat()
+
+
+def ts_of(raw):
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
 
 
 def kick_time(f):
@@ -74,6 +107,41 @@ def kick_time(f):
         return dt.astimezone(WAT).strftime("%a %d %b, %I:%M %p")
     except Exception:
         return raw
+
+
+# =========================================================
+# SPORTAPI WITH A MEMORY (saves your daily request limit)
+# =========================================================
+
+_MEM = {}
+_MISS = object()
+
+
+def sa_get(path, ttl):
+    """sportapi.get with our own memory on top. Remembers failures too (a wrong
+    team slug is not asked again), so a missing team never costs a call twice."""
+
+    hit = _MEM.get(path)
+
+    if hit and time.time() - hit[0] < hit[1]:
+        if hit[2] is _MISS:
+            raise LookupError("remembered: not found")
+        return hit[2]
+
+    try:
+        data = sportapi.get(path, ttl)
+    except Exception as e:
+        msg = str(e)
+        if "limit" in msg.lower():
+            raise
+        _MEM[path] = (time.time(), 86400 if "404" in msg else 900, _MISS)
+        raise
+
+    if len(_MEM) > 4000:
+        _MEM.clear()
+
+    _MEM[path] = (time.time(), ttl, data)
+    return data
 
 
 # =========================================================
@@ -142,13 +210,13 @@ LEAGUE_GROUPS = [
 ]
 
 TOP_LEAGUES = {
-    "premier league": ("premier league", "english premier league"),
-    "la liga": ("la liga", "laliga"),
-    "serie a": ("serie a",),
-    "bundesliga": ("bundesliga",),
-    "ligue 1": ("ligue 1",),
-    "eredivisie": ("eredivisie",),
-    "championship": ("championship", "efl championship"),
+    "premier league": ("premier league", "english premier league", "england premier league"),
+    "la liga": ("la liga", "laliga", "spain la liga", "spain laliga"),
+    "serie a": ("serie a", "italy serie a"),
+    "bundesliga": ("bundesliga", "germany bundesliga"),
+    "ligue 1": ("ligue 1", "france ligue 1"),
+    "eredivisie": ("eredivisie", "netherlands eredivisie"),
+    "championship": ("championship", "efl championship", "england championship"),
 }
 
 
@@ -159,13 +227,14 @@ def mentions_league(t):
     return any(k in t for k in TOP_LEAGUES)
 
 
-def pick_leagues(t, fixtures):
-    """Filter fixtures by the league the user mentioned. Returns (fixtures, label)."""
+def pick_leagues(t, items):
+    """Filter dicts that have a 'league_name' by the league the user mentioned.
+    Returns (items, label)."""
 
     for triggers, words, label in LEAGUE_GROUPS:
         if any(k in t for k in triggers):
             out = []
-            for f in fixtures:
+            for f in items:
                 n = f.get("league_name", "").lower()
                 if any(w in n for w in words) and not any(x in n for x in EXCLUDE):
                     out.append(f)
@@ -173,14 +242,14 @@ def pick_leagues(t, fixtures):
 
     for key, variants in TOP_LEAGUES.items():
         if key in t:
-            return [f for f in fixtures if f.get("league_name", "").lower() in variants], key.title()
+            return [f for f in items if f.get("league_name", "").lower() in variants], key.title()
 
-    names = {f.get("league_name", "") for f in fixtures}
+    names = {f.get("league_name", "") for f in items}
     hit = [n for n in names if len(n) >= 5 and n.lower() in t]
     if hit:
-        return [f for f in fixtures if f.get("league_name") in hit], ", ".join(hit)
+        return [f for f in items if f.get("league_name") in hit], ", ".join(hit)
 
-    return fixtures, "all leagues"
+    return items, "all leagues"
 
 
 # ---- bookmakers and booking codes ----
@@ -240,7 +309,7 @@ def detect_code(text):
 
 def lookup_slug(f, team_id):
     try:
-        rows = sportapi.get(f"/standings/{f['league_id']}", sportapi.H6).get("data", [])
+        rows = sa_get(f"/standings/{f['league_id']}", sportapi.H6).get("data", [])
         for r in rows:
             if r["team"]["id"] == team_id:
                 return r["team"]["slug"]
@@ -255,7 +324,7 @@ def team_form(f, side):
 
     def fetch_results(s):
         try:
-            return sportapi.get(f"/teams/slug/{s}", sportapi.H6).get("results", [])
+            return sa_get(f"/teams/slug/{s}", sportapi.H6).get("results", [])
         except Exception:
             return []
 
@@ -332,7 +401,7 @@ def load_forms(fixtures):
         try:
             return tid, team_form(f, side)
         except Exception as e:
-            print("FORM ERROR:", f.get(f"{side}_team"), type(e).__name__, e)
+            print("FORM ERROR:", f.get(f"{side}_team"), type(e).__name__, e, flush=True)
             return tid, None
 
     ex = ThreadPoolExecutor(max_workers=8)
@@ -340,7 +409,7 @@ def load_forms(fixtures):
 
     done, pending = wait(futs, timeout=FORM_BUDGET)
 
-    # let slow requests finish in the background (they fill the cache for next time)
+    # slow requests keep running in the background and fill the memory for next time
     ex.shutdown(wait=False, cancel_futures=True)
 
     forms = {}
@@ -422,24 +491,29 @@ def reason_text(key, f, h, a):
     )
 
 
-def evaluate(f, h, a, market):
+def evaluate(f, h, a, market, ev=None):
+    """f = display dict (names, league, kickoff). ev = SportyBet event, if known."""
+
     keys = ["gg", "over25", "over15"] if market == "auto" else [market]
 
     best = None
 
     for k in keys:
+        # when we know the SportyBet event, only use markets it actually lists
+        if ev is not None and not sportybet.market_pick(ev, k):
+            continue
         r = score_market(k, h, a)
         if best is None or r["margin"] > best["margin"]:
             best = {**r, "key": k}
 
     if best and best["strong"]:
-        return {"f": f, "h": h, "a": a, **best}
+        return {"f": f, "h": h, "a": a, "ev": ev, **best}
 
     return None
 
 
 # =========================================================
-# SPORTYBET: FINDING THE RIGHT SELECTION
+# SPORTYBET: FALLBACK MARKET SEARCH (only if the list has no odds for a market)
 # =========================================================
 
 LABEL_KEYS = (
@@ -504,31 +578,8 @@ def find_selection(markets, key):
     return None
 
 
-def warm_sportybet():
-    """Load SportyBet's event list once. Returns '' if OK, otherwise the reason it failed."""
-
-    fn = getattr(sportybet, "_events", None)
-
-    if fn is None:
-        return ""
-
-    ex = ThreadPoolExecutor(max_workers=1)
-    fu = ex.submit(fn, "football")
-    done, _ = wait([fu], timeout=MARKET_BUDGET)
-    ex.shutdown(wait=False)
-
-    if not done:
-        return "SportyBet did not answer in time"
-
-    try:
-        fu.result()
-        return ""
-    except Exception as e:
-        return str(e) or type(e).__name__
-
-
 def lookup_leg(c):
-    """Find the SportyBet selection for one candidate. Returns (candidate, leg_or_None, why)."""
+    """Fallback: ask SportyBet's event page for the selection. Returns (candidate, leg_or_None, why)."""
 
     f = c["f"]
     spec = MARKETS[c["key"]]
@@ -543,7 +594,7 @@ def lookup_leg(c):
     sel = find_selection(data, c["key"])
 
     if not sel:
-        print("NO SELECTION FOUND:", c["key"], f["home_team"], "v", f["away_team"])
+        print("NO SELECTION FOUND:", c["key"], f["home_team"], "v", f["away_team"], flush=True)
         return c, None, "market not found on SportyBet"
 
     try:
@@ -551,20 +602,50 @@ def lookup_leg(c):
     except Exception:
         return c, None, "odds missing"
 
-    leg = {
+    return c, make_leg(c, sel["ref"], odds), ""
+
+
+def make_leg(c, ref, odds):
+    f = c["f"]
+    spec = MARKETS[c["key"]]
+
+    return {
         "home": f["home_team"],
         "away": f["away_team"],
         "kickoff": f.get("kickoff_utc", ""),
         "sport": "football",
-        "ref": sel["ref"],
+        "ref": ref,
         "market": spec["market"],
         "pick": spec["pick"],
         "odds": odds,
         "reason": reason_text(c["key"], f, c["h"], c["a"]),
         "league": f.get("league_name", ""),
+        "kickoff_label": kick_time(f),
     }
 
-    return c, leg, ""
+
+def warm_sportybet():
+    """Load SportyBet's match list once. Returns (status, message):
+    ("ok", ""), ("timeout", msg) or ("error", msg)."""
+
+    fn = getattr(sportybet, "_events", None)
+
+    if fn is None:
+        return "ok", ""
+
+    ex = ThreadPoolExecutor(max_workers=1)
+    fu = ex.submit(fn, "football")
+    done, _ = wait([fu], timeout=EVENTS_BUDGET)
+    ex.shutdown(wait=False)
+
+    if not done:
+        return "timeout", "SportyBet's match list is still loading"
+
+    try:
+        fu.result()
+        return "ok", ""
+    except Exception as e:
+        return "error", (str(e) or type(e).__name__)
 
 
 # =========================================================
@@ -594,6 +675,75 @@ def format_legs(legs):
     return "\n\n".join(lines)
 
 
+def sa_fixtures(d):
+    data = sa_get(f"/fixtures/date/{d.isoformat()}", sportapi.H1).get("data", [])
+    return [f for f in data if f.get("status") == "Scheduled"]
+
+
+def match_fixture(ev, fixtures):
+    """Find the SportAPI fixture that is the same match as a SportyBet event."""
+
+    best, best_score = None, 0.0
+
+    for f in fixtures:
+        ts = ts_of(f.get("kickoff_utc"))
+        if ts is None or abs(ts * 1000 - ev["ms"]) > 30 * 60 * 1000:
+            continue
+        score = (sim(ev["home"], f["home_team"]) + sim(ev["away"], f["away_team"])) / 2
+        if score > best_score:
+            best, best_score = f, score
+
+    return best if best_score >= 0.70 else None
+
+
+def sb_window_events(d_from, d_to):
+    """SportyBet football events kicking off in the window (Nigeria time), not started yet."""
+
+    start = datetime.combine(d_from, datetime.min.time(), tzinfo=WAT).timestamp() * 1000
+    end = datetime.combine(d_to + timedelta(days=1), datetime.min.time(), tzinfo=WAT).timestamp() * 1000
+    now_ms = time.time() * 1000
+
+    return [
+        e for e in sportybet._events("football")
+        if max(start, now_ms) <= e["ms"] < end
+    ]
+
+
+def rank_events(evs, market, k):
+    """Pick the k most promising events using SportyBet's own odds (no SportAPI calls)."""
+
+    def odds_of(ev, key):
+        p = sportybet.market_pick(ev, key)
+        return p["odds"] if p else None
+
+    def proxy(ev, key):
+        o = odds_of(ev, key)
+        if o:
+            return o
+        o25 = odds_of(ev, "over25")          # high-scoring games are good for GG and Over 1.5 too
+        return (o25 + 0.3) if o25 else 99
+
+    keys = ["gg", "over25"] if market == "auto" else [market]
+    per = max(4, k // len(keys))
+
+    chosen = {}
+
+    for key in keys:
+        for ev in sorted(evs, key=lambda e: proxy(e, key))[:per]:
+            chosen[ev["event_id"]] = ev
+
+    return list(chosen.values())[:k]
+
+
+def display_fixture(ev):
+    return {
+        "home_team": ev["home"],
+        "away_team": ev["away"],
+        "league_name": ev["league"],
+        "kickoff_utc": iso_from_ms(ev["ms"]),
+    }
+
+
 def build_ticket(t, s):
     d_from, d_to, when = parse_dates(t)
     market = parse_market(t) or "auto"
@@ -602,44 +752,67 @@ def build_ticket(t, s):
     if not count and not target:
         count = 5
 
-    fixtures = []
-    d = d_from
-    while d <= d_to:
-        data = sportapi.get(f"/fixtures/date/{d.isoformat()}", sportapi.H1).get("data", [])
-        fixtures += [f for f in data if f.get("status") == "Scheduled"]
-        d += timedelta(days=1)
+    k = min(MAX_ANALYSE, max(8, (count or 5) * 2))
 
-    seen, unique = set(), []
-    for f in fixtures:
-        k = (f.get("home_id"), f.get("away_id"), f.get("kickoff_utc"))
-        if k not in seen:
-            seen.add(k)
-            unique.append(f)
-    fixtures = unique
+    status, sb_msg = warm_sportybet()
 
-    fixtures, league_label = pick_leagues(t, fixtures)
-
-    if not fixtures:
+    if status == "timeout":
         return (
-            f"I found no scheduled {league_label} matches for {when}. "
+            "SportyBet's match list is still loading (the first load after a restart takes "
+            "up to a minute). Ask me again in a minute and it will answer fast."
+        )
+
+    if status == "error":
+        return stats_only(t, d_from, d_to, when, market, count, k, sb_msg)
+
+    # ---- 1. SportyBet's own list, no SportAPI calls
+    evs = sb_window_events(d_from, d_to)
+
+    pseudo = [{"league_name": e["league"], "_ev": e} for e in evs]
+    pseudo, league_label = pick_leagues(t, pseudo)
+    evs = [p["_ev"] for p in pseudo]
+
+    if not evs:
+        return (
+            f"SportyBet has no {'' if league_label == 'all leagues' else league_label + ' '}matches for {when}. "
             f"Try another day or league, for example: "
             f"\"Give me 5 GG matches from tomorrow's Premier League\"."
         )
 
-    fixtures.sort(key=lambda f: f.get("kickoff_utc", ""))
-    total_found = len(fixtures)
-    fixtures = fixtures[:MAX_ANALYSE]
+    total_found = len(evs)
+    chosen = rank_events(evs, market, k)
 
-    forms, unfinished = load_forms(fixtures)
+    # ---- 2. match them with SportAPI and check form (few calls, all remembered)
+    dates = sorted({datetime.fromtimestamp(e["ms"] / 1000, timezone.utc).date() for e in chosen})
 
-    cands, no_data = [], 0
+    fixtures = []
+    for d in dates:
+        try:
+            fixtures += sa_fixtures(d)
+        except Exception as e:
+            if "limit" in str(e).lower():
+                return f"SportAPI daily limit reached. It resets at 00:00 UTC. ({e})"
+            print("FIXTURES ERROR:", d, e, flush=True)
 
-    for f in fixtures:
-        h, a = forms.get(f["home_id"]), forms.get(f["away_id"])
+    pairs, no_stats = [], 0
+
+    for ev in chosen:
+        fx = match_fixture(ev, fixtures)
+        if fx:
+            pairs.append((ev, fx))
+        else:
+            no_stats += 1
+
+    forms, unfinished = load_forms([fx for _, fx in pairs])
+
+    cands = []
+
+    for ev, fx in pairs:
+        h, a = forms.get(fx["home_id"]), forms.get(fx["away_id"])
         if not h or not a:
-            no_data += 1
+            no_stats += 1
             continue
-        c = evaluate(f, h, a, market)
+        c = evaluate(display_fixture(ev), h, a, market, ev)
         if c:
             cands.append(c)
 
@@ -647,88 +820,49 @@ def build_ticket(t, s):
 
     if not cands:
         return (
-            f"I checked {len(fixtures)} {league_label} matches for {when}, but none passed "
-            f"the stats check ({no_data} had no usable form data). "
-            f"I would rather give you nothing than weak picks."
+            f"I checked the form of {len(pairs)} {league_label} matches for {when} "
+            f"(best {len(chosen)} of {total_found} on SportyBet), but none passed the stats check "
+            f"({no_stats} had no usable form data). I would rather give you nothing than weak picks."
         )
 
-    # look up real SportyBet odds for the best candidates (in parallel)
-    top = cands[: (count + 4) if count else 15]
-
-    sb_error = warm_sportybet()
-
-    looked = []
-
-    if sb_error:
-        looked = [(c, None, sb_error) for c in top]
-    else:
-        ex = ThreadPoolExecutor(max_workers=3)
-        futs = [ex.submit(lookup_leg, c) for c in top]
-        done, pending = wait(futs, timeout=MARKET_BUDGET)
-        ex.shutdown(wait=False, cancel_futures=True)
-
-        for c, fu in zip(top, futs):
-            if fu in done:
-                try:
-                    looked.append(fu.result())
-                except Exception as e:
-                    looked.append((c, None, f"error ({type(e).__name__})"))
-            else:
-                looked.append((c, None, "SportyBet was too slow"))
-
+    # ---- 3. build the ticket with the odds from SportyBet's list
     legs, skipped = [], []
+    fallback_left = (count or 8) + 3
 
-    for c, leg, why in looked:
-        f = c["f"]
-        if not leg:
-            skipped.append(f"{f['home_team']} vs {f['away_team']}: {why}")
-            continue
-
-        leg["kickoff_label"] = kick_time(f)
-
+    for c in cands:
         if count and len(legs) >= count:
             break
         if target and legs and prod(legs) >= target:
             break
 
-        legs.append(leg)
+        pick = sportybet.market_pick(c["ev"], c["key"])
+
+        if pick:
+            legs.append(make_leg(c, pick["ref"], pick["odds"]))
+            continue
+
+        if fallback_left <= 0:
+            continue
+
+        fallback_left -= 1
+        _, leg, why = lookup_leg(c)
+
+        if leg:
+            legs.append(leg)
+        else:
+            f = c["f"]
+            skipped.append(f"{f['home_team']} vs {f['away_team']}: {why}")
 
     if not legs:
-        picks = []
-        for i, c in enumerate(cands[: (count or 8)], 1):
-            f = c["f"]
-            picks.append(
-                f"{i}. {f['home_team']} vs {f['away_team']}\n"
-                f"   {f.get('league_name', '')} · {kick_time(f)}\n"
-                f"   Market: {MARKETS[c['key']]['label']}\n"
-                f"   {reason_text(c['key'], f, c['h'], c['a'])}"
-            )
-
-        why = sb_error or (skipped[0].split(": ", 1)[-1] if skipped else "SportyBet gave no data")
-
         return (
-            "The stats check worked, but SportyBet did not return any odds, so I cannot "
-            "make a booking code right now. These are the matches that passed:\n\n"
-            + "\n\n".join(picks)
-            + "\n\nQuick list to add by hand in the SportyBet app:\n"
-            + "\n".join(
-                f"• {c['f']['home_team']} v {c['f']['away_team']} - "
-                f"{MARKETS[c['key']]['market']}: {MARKETS[c['key']]['pick']}"
-                for c in cands[: (count or 8)]
-            )
-            + "\n\nWhy no code: " + why
-            + (
-                "\n\nSportyBet is blocking this server's connection. Run BetOracle on your own "
-                "computer (home internet), or set a SPORTYBET_PROXY on Render."
-                if any(w in why.lower() for w in ("blocking", "bot protection", "202"))
-                else ""
-            )
+            "Matches passed the stats check, but I could not read their odds on SportyBet.\n"
+            + "\n".join(skipped[:5])
         )
 
     s["ticket"][:] = legs
     s["slips"] = []
 
-    # book it
+    # ---- 4. book it
     try:
         item = book_legs(legs, s)
         code_line = f"🎟 BOOKING CODE: {item['code']}\n{item['games']} games · total odds {item['odds']}"
@@ -755,12 +889,13 @@ def build_ticket(t, s):
     if unfinished:
         notes.append(
             f"The stats server was slow, so {unfinished} teams were not checked in time. "
-            f"Ask again in a minute: what was already loaded is cached, so it will be faster."
+            f"Ask again in a minute: what was loaded is remembered, so it will be faster."
         )
 
     notes.append(
-        f"Checked {len(fixtures)} of {total_found} {league_label} matches for {when}"
-        + (f" ({no_data} had no form data)." if no_data else ".")
+        f"Form checked for {len(pairs)} of the best {len(chosen)} {league_label} matches "
+        f"({total_found} on SportyBet for {when})"
+        + (f"; {no_stats} had no form data." if no_stats else ".")
     )
 
     reply = code_line + "\n\n" + "\n".join(notes) + "\n\n" + format_legs(legs)
@@ -771,6 +906,72 @@ def build_ticket(t, s):
     reply += "\n\nSay \"convert to Bet9ja\" (or MSport, BetNaija...) to move this code."
 
     return reply
+
+
+def stats_only(t, d_from, d_to, when, market, count, k, why):
+    """SportyBet is unavailable: still show the stats-based picks (no odds, no code)."""
+
+    fixtures = []
+    d = d_from
+    while d <= d_to:
+        try:
+            fixtures += sa_fixtures(d)
+        except Exception as e:
+            print("FIXTURES ERROR:", d, e, flush=True)
+        d += timedelta(days=1)
+
+    fixtures, league_label = pick_leagues(t, fixtures)
+
+    if not fixtures:
+        return f"I found no scheduled {league_label} matches for {when}."
+
+    fixtures.sort(key=lambda f: f.get("kickoff_utc", ""))
+    fixtures = fixtures[:k]
+
+    forms, _ = load_forms(fixtures)
+
+    cands = []
+
+    for f in fixtures:
+        h, a = forms.get(f["home_id"]), forms.get(f["away_id"])
+        if not h or not a:
+            continue
+        c = evaluate(f, h, a, market)
+        if c:
+            cands.append(c)
+
+    cands.sort(key=lambda c: -c["margin"])
+
+    if not cands:
+        return (
+            f"SportyBet is not answering ({why}), and none of the {len(fixtures)} matches "
+            f"I checked passed the stats check."
+        )
+
+    shown = cands[: (count or 8)]
+
+    picks = []
+    for i, c in enumerate(shown, 1):
+        f = c["f"]
+        picks.append(
+            f"{i}. {f['home_team']} vs {f['away_team']}\n"
+            f"   {f.get('league_name', '')} · {kick_time(f)}\n"
+            f"   Market: {MARKETS[c['key']]['label']}\n"
+            f"   {reason_text(c['key'], f, c['h'], c['a'])}"
+        )
+
+    return (
+        "SportyBet did not answer, so I cannot make a booking code right now. "
+        "These matches passed the stats check:\n\n"
+        + "\n\n".join(picks)
+        + "\n\nQuick list to add by hand in the SportyBet app:\n"
+        + "\n".join(
+            f"• {c['f']['home_team']} v {c['f']['away_team']} - "
+            f"{MARKETS[c['key']]['market']}: {MARKETS[c['key']]['pick']}"
+            for c in shown
+        )
+        + f"\n\nWhy no code: {why}"
+    )
 
 
 # =========================================================
@@ -890,7 +1091,7 @@ def do_remove(t, s):
 
     return (
         f"Removed {gone} leg(s). {len(legs)} games left, total odds {prod(legs)}.\n\n"
-        + format_legs([{**x, "league": x.get("league", ""), "kickoff_label": ""} for x in legs])
+        + format_legs([{**x, "league": x.get("league", ""), "kickoff_label": x.get("kickoff_label", "")} for x in legs])
         + "\n\nSay \"book this ticket\" for a new code."
     )
 
@@ -980,6 +1181,20 @@ class Chat(BaseModel):
 app = FastAPI()
 
 
+@app.on_event("startup")
+def preload_sportybet():
+    """Load SportyBet's match list in the background so the first request is fast."""
+
+    def go():
+        try:
+            sportybet._events("football")
+            print("SportyBet match list preloaded", flush=True)
+        except Exception as e:
+            print("Preload failed:", e, flush=True)
+
+    threading.Thread(target=go, daemon=True).start()
+
+
 @app.post("/api/chat")
 def chat(c: Chat):
 
@@ -1006,14 +1221,13 @@ def chat(c: Chat):
 def debug_markets(home: str, away: str, search: str = ""):
     """Shows the raw SportyBet market data for a match. Use it to fix market matching."""
 
-    import time as _t
-    t0 = _t.time()
+    t0 = time.time()
 
     try:
         data = sportybet.get_markets("football", home, away, search or None)
-        return {"seconds": round(_t.time() - t0, 1), "type": type(data).__name__, "data": data}
+        return {"seconds": round(time.time() - t0, 1), "type": type(data).__name__, "data": data}
     except Exception as e:
-        return {"seconds": round(_t.time() - t0, 1), "error": f"{type(e).__name__}: {e}"}
+        return {"seconds": round(time.time() - t0, 1), "error": f"{type(e).__name__}: {e}"}
 
 
 @app.get("/api/usage")
