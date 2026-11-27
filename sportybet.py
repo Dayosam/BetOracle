@@ -44,6 +44,8 @@ TIMEOUT = 20
 
 PROXY = os.getenv("SPORTYBET_PROXY") or None
 _OPEN = build_opener(ProxyHandler({"http": PROXY, "https": PROXY})).open if PROXY else urlopen
+VIRTUAL_RE = re.compile(
+    r"\bsrl\b|simulated|virtual|e-?soccer|e-?football|cyber|volta|battle\s*-?\s*\d+\s*min", re.I)
 _EV_LOCK = threading.Lock()
 EVENTS_TTL = int(os.getenv("SPORTYBET_EVENTS_TTL", "1800"))   # seconds the event list is reused
 _EV_MEM = {}      # sport -> (time, events)
@@ -122,6 +124,9 @@ def _events_locked(sport):
                  {"sportId": sid, "marketId": LIST_IDS, "pageSize": 100, "pageNum": page, "todayGames": "false"}, 0) or {}
         for t in d.get("tournaments") or []:
             for e in t.get("events") or []:
+                if VIRTUAL_RE.search(" ".join(str(x or "") for x in (
+                        e.get("homeTeamName"), e.get("awayTeamName"), t.get("name"), t.get("categoryName")))):
+                    continue          # virtual / e-soccer games have no real form
                 out.append({"event_id": e["eventId"], "home": e["homeTeamName"], "away": e["awayTeamName"],
                             "ms": e["estimateStartTime"], "league": f'{t.get("categoryName", "")} {t.get("name", "")}'.strip(),
                             "markets": e.get("markets") or []})
