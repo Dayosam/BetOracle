@@ -10,6 +10,9 @@ This version sends requests EXACTLY the way the working SportyTips provider does
 - HTTP 202 (SportyBet's bot-protection answer) fails immediately with a clear message.
 - Optional SPORTYBET_PROXY environment variable (http://user:pass@host:port).
 - The event list is fetched under a lock, so parallel requests do not hammer SportyBet.
+- The event list (with the GG and Over/Under odds that come with it) is also kept in this
+  process's own memory for 30 minutes, and each event page for 5 minutes, so repeat requests
+  cost nothing even if cache.py does not keep them.
 """
 import os, re, json, time, threading
 from urllib.error import HTTPError, URLError
@@ -42,6 +45,9 @@ TIMEOUT = 20
 PROXY = os.getenv("SPORTYBET_PROXY") or None
 _OPEN = build_opener(ProxyHandler({"http": PROXY, "https": PROXY})).open if PROXY else urlopen
 _EV_LOCK = threading.Lock()
+EVENTS_TTL = int(os.getenv("SPORTYBET_EVENTS_TTL", "1800"))   # seconds the event list is reused
+_EV_MEM = {}      # sport -> (time, events)
+_MK_MEM = {}      # event id -> (time, event page data)
 
 BLOCKED_MSG = ("SportyBet bot protection (HTTP 202) is blocking this server's connection. "
                "Run BetOracle from your own computer, or set SPORTYBET_PROXY.")
@@ -102,6 +108,8 @@ def _get(path, params=None, ttl=300):
             return j.get("data")
 
         raise RuntimeError(f"SportyBet is rate limiting or unreachable ({last}). Wait a few minutes and retry.")
+    if ttl <= 0:      # kept in this process's memory by the caller, not in cache.py / Upstash
+        return call()
     return cached("sb:" + path + repr(sorted((params or {}).items())), ttl, call)
 
 
@@ -111,11 +119,12 @@ def _events_locked(sport):
     out, page = [], 1
     while page <= 40:
         d = _get("/factsCenter/pcUpcomingEvents",
-                 {"sportId": sid, "marketId": LIST_IDS, "pageSize": 100, "pageNum": page, "todayGames": "false"}, 600) or {}
+                 {"sportId": sid, "marketId": LIST_IDS, "pageSize": 100, "pageNum": page, "todayGames": "false"}, 0) or {}
         for t in d.get("tournaments") or []:
             for e in t.get("events") or []:
                 out.append({"event_id": e["eventId"], "home": e["homeTeamName"], "away": e["awayTeamName"],
-                            "ms": e["estimateStartTime"], "league": f'{t.get("categoryName", "")} {t.get("name", "")}'.strip()})
+                            "ms": e["estimateStartTime"], "league": f'{t.get("categoryName", "")} {t.get("name", "")}'.strip(),
+                            "markets": e.get("markets") or []})
         if page * 100 >= d.get("totalNum", 0) or not d.get("tournaments"): break
         page += 1
     return out
@@ -124,7 +133,40 @@ def _events_locked(sport):
 def _events(sport):
     # one thread at a time: the first call fills the cache, the others reuse it
     with _EV_LOCK:
-        return _events_locked(sport)
+        hit = _EV_MEM.get(sport.lower())
+        if hit and time.time() - hit[0] < EVENTS_TTL:
+            return hit[1]
+        data = _events_locked(sport)
+        _EV_MEM[sport.lower()] = (time.time(), data)
+        return data
+
+
+# ids from the SportyTips provider (all verified there)
+PICK_SPECS = {
+    "gg":     ("29", "",           "74", "GG/NG",         "Yes"),
+    "over25": ("18", "total=2.5",  "12", "Over/Under 2.5", "Over 2.5"),
+    "over15": ("18", "total=1.5",  "12", "Over/Under 1.5", "Over 1.5"),
+}
+
+
+def market_pick(ev, key):
+    """Odds + ref for GG / Over 2.5 / Over 1.5 straight from the event list. None if not listed."""
+    mid, spec, oid, mname, pname = PICK_SPECS[key]
+    for m in ev.get("markets") or []:
+        if str(m.get("id")) != mid or (m.get("specifier") or "") != spec:
+            continue
+        if m.get("status") not in (None, 0):
+            continue
+        for o in m.get("outcomes") or []:
+            if str(o.get("id")) != oid or o.get("isActive") in (False, 0):
+                continue
+            try:
+                odds = float(o["odds"])
+            except Exception:
+                continue
+            return {"odds": odds, "market": mname, "pick": pname,
+                    "ref": f'{ev["event_id"]}|{mid}|{spec}|{oid}'}
+    return None
 
 
 def list_events(sport, date_from, date_to, league=None):
@@ -148,7 +190,12 @@ def _find(sport, home, away):
 
 def get_markets(sport, home, away, search=None):
     ev = _find(sport, home, away)
-    d = _get("/factsCenter/event", {"eventId": ev["event_id"], "productId": 3}, 300) or {}
+    hit = _MK_MEM.get(ev["event_id"])
+    if hit and time.time() - hit[0] < 300:
+        d = hit[1]
+    else:
+        d = _get("/factsCenter/event", {"eventId": ev["event_id"], "productId": 3}, 300) or {}
+        _MK_MEM[ev["event_id"]] = (time.time(), d)
     main, rows = set(MAIN_IDS.split(",")), []
     for m in d.get("markets") or []:
         if m.get("status") != 0: continue
