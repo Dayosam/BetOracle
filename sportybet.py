@@ -1,6 +1,12 @@
 """SportyBet Nigeria adapter. SportyBet has no public API: this talks to the same JSON endpoints its own website uses.
-They are unofficial and can change. Run `python test_sportybet.py` first to confirm they still answer as expected."""
-import re, time, httpx
+They are unofficial and can change. Run `python test_sportybet.py` first to confirm they still answer as expected.
+
+Changes in this version:
+- HTTP 202 (SportyBet's bot-protection challenge) now fails immediately with a clear message instead of retrying.
+- Optional SPORTYBET_PROXY environment variable: route SportyBet requests through a proxy
+  (for example http://user:pass@host:port) when the server's own IP is blocked.
+- Fetching the event list is serialised with a lock, so parallel requests no longer hammer SportyBet."""
+import os, re, time, threading, httpx
 from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
 from cache import cached
@@ -14,44 +20,55 @@ SPORTS = {"football": "sr:sport:1", "basketball": "sr:sport:2", "baseball": "sr:
 MAIN_IDS = "1,18,10,11,29,16,225,219"
 LAGOS = timezone(timedelta(hours=1))
 
+PROXY = os.getenv("SPORTYBET_PROXY") or None
+_PX = {"proxy": PROXY} if PROXY else {}
+_EV_LOCK = threading.Lock()
+
+BLOCKED_MSG = ("SportyBet bot protection (HTTP 202) is blocking this server's connection. "
+               "Run BetOracle from your own computer, or set SPORTYBET_PROXY.")
+
 def _get(path, params=None, ttl=300):
     def call():
         for wait in (0, 6, 20):
             time.sleep(wait)
             try:
-                r = httpx.get(BASE + path, params=params, headers=HEAD, timeout=15)
+                r = httpx.get(BASE + path, params=params, headers=HEAD, timeout=15, **_PX)
             except httpx.RequestError as e:
-                print(f"SPORTYBET NETWORK ERROR: {e}")
+                print(f"SPORTYBET NETWORK ERROR: {e}", flush=True)
                 continue
-                
+
+            if r.status_code == 202:
+                print("SPORTYBET BLOCKED: HTTP 202 (bot-protection challenge)", flush=True)
+                raise RuntimeError(BLOCKED_MSG)
+
             if r.status_code == 429:
-                print("SPORTYBET RATE LIMIT (429)")
+                print("SPORTYBET RATE LIMIT (429)", flush=True)
                 continue
-                
+
             if r.status_code != 200:
-                print(f"SPORTYBET ERROR: HTTP {r.status_code} - {r.text[:200]}")
+                print(f"SPORTYBET ERROR: HTTP {r.status_code} - {r.text[:200]}", flush=True)
                 continue
 
             try:
                 j = r.json()
             except Exception:
-                print(f"SPORTYBET ERROR: Invalid JSON. Response text: {r.text[:500]}")
+                print(f"SPORTYBET ERROR: Invalid JSON. Response text: {r.text[:500]}", flush=True)
                 continue
 
             if j.get("bizCode") == 19411:
-                print("SPORTYBET BIZCODE 19411 (Rate Limit)")
+                print("SPORTYBET BIZCODE 19411 (Rate Limit)", flush=True)
                 continue
-                
-            if j.get("bizCode") != 10000: 
-                print(f"SPORTYBET BIZCODE ERROR: {j.get('bizCode')} - {j.get('message')}")
+
+            if j.get("bizCode") != 10000:
+                print(f"SPORTYBET BIZCODE ERROR: {j.get('bizCode')} - {j.get('message')}", flush=True)
                 raise RuntimeError(f"SportyBet answered {j.get('bizCode')}: {j.get('message')}")
-                
+
             return j["data"]
-            
+
         raise RuntimeError("SportyBet is rate limiting or blocking this server. Wait a few minutes and retry.")
     return cached("sb:" + path + repr(sorted((params or {}).items())), ttl, call)
 
-def _events(sport):
+def _events_locked(sport):
     sid = SPORTS.get(sport.lower())
     if not sid: raise ValueError(f"Unknown sport '{sport}'. Known: {', '.join(SPORTS)}")
     out, page = [], 1
@@ -64,6 +81,11 @@ def _events(sport):
         if page * 100 >= d.get("totalNum", 0) or not d.get("tournaments"): break
         page += 1
     return out
+
+def _events(sport):
+    # one thread at a time: the first call fills the cache, the others reuse it
+    with _EV_LOCK:
+        return _events_locked(sport)
 
 def list_events(sport, date_from, date_to, league=None):
     out = []
@@ -108,7 +130,8 @@ def book(selections):
     for ref in refs:
         eid, mid, spec, oid = ref.split("|")
         items.append({"eventId": eid, "marketId": mid, "outcomeId": oid, **({"specifier": spec} if spec else {})})
-    r = httpx.post(BASE + "/orders/share", json={"selections": items}, headers=HEAD, timeout=25)
+    r = httpx.post(BASE + "/orders/share", json={"selections": items}, headers=HEAD, timeout=25, **_PX)
+    if r.status_code == 202: raise RuntimeError(BLOCKED_MSG)
     if r.status_code == 429: raise RuntimeError("SportyBet is rate limiting booking requests. Wait a few minutes.")
     r.raise_for_status()
     j = r.json()
