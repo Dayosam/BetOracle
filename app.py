@@ -101,6 +101,17 @@ def ts_of(raw):
         return None
 
 
+def kick_short(f):
+    raw = f.get("kickoff_utc") or ""
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(WAT).strftime("%I:%M %p").lstrip("0").lower()
+    except Exception:
+        return ""
+
+
 def kick_time(f):
     raw = f.get("kickoff_utc") or ""
     try:
@@ -175,6 +186,10 @@ def parse_market(t):
         return "over25"
     if re.search(r"\bover\s*1\.?5\b|\bo1\.?5\b", t):
         return "over15"
+    if re.search(r"\b(double chance|dc|1x|x2|home or draw|draw or away)\b", t):
+        return "dc"
+    if re.search(r"\b(straight wins?|win only|wins only|home win|away win|match winner|1x2|to win|winners?)\b", t):
+        return "win"
     return None
 
 
@@ -369,23 +384,31 @@ def team_form(f, side):
             (m["home_score"], m["away_score"]) if home
             else (m["away_score"], m["home_score"])
         )
-        rows.append((gf, ga))
+        rows.append((gf, ga, "H" if home else "A"))
 
     n = len(rows)
 
     if n < MIN_FORM:
         return None
 
-    sc = sum(1 for gf, ga in rows if gf > 0)
-    co = sum(1 for gf, ga in rows if ga > 0)
-    bt = sum(1 for gf, ga in rows if gf > 0 and ga > 0)
-    o15 = sum(1 for gf, ga in rows if gf + ga >= 2)
-    o25 = sum(1 for gf, ga in rows if gf + ga >= 3)
+    sc = sum(1 for gf, ga, _ in rows if gf > 0)
+    co = sum(1 for gf, ga, _ in rows if ga > 0)
+    bt = sum(1 for gf, ga, _ in rows if gf > 0 and ga > 0)
+    o15 = sum(1 for gf, ga, _ in rows if gf + ga >= 2)
+    o25 = sum(1 for gf, ga, _ in rows if gf + ga >= 3)
+
+    def wdl(sub):
+        w = sum(1 for gf, ga, _ in sub if gf > ga)
+        d = sum(1 for gf, ga, _ in sub if gf == ga)
+        return {"n": len(sub), "w": w, "d": d, "l": len(sub) - w - d}
 
     return {
         "n": n, "sc": sc, "co": co, "bt": bt, "o15c": o15, "o25c": o25,
         "scored": sc / n, "conceded": co / n, "btts": bt / n,
         "o15": o15 / n, "o25": o25 / n,
+        "all": wdl(rows),
+        "H": wdl([r for r in rows if r[2] == "H"]),
+        "A": wdl([r for r in rows if r[2] == "A"]),
     }
 
 
@@ -433,24 +456,61 @@ def load_forms(fixtures, budget=None):
 
 MARKETS = {
     "gg": {
-        "label": "GG (both teams to score)",
+        "label": "GG (both teams to score)", "show": "BTTS Yes",
         "market": "GG/NG", "pick": "Yes",
         "search": "GG/NG,Both Teams To Score,BTTS",
     },
     "over25": {
-        "label": "Over 2.5 goals",
+        "label": "Over 2.5 goals", "show": "Over 2.5 Goals",
         "market": "Over/Under 2.5", "pick": "Over 2.5",
         "search": "Over/Under,Total",
     },
     "over15": {
-        "label": "Over 1.5 goals",
+        "label": "Over 1.5 goals", "show": "Over 1.5 Goals",
         "market": "Over/Under 1.5", "pick": "Over 1.5",
         "search": "Over/Under,Total",
     },
+    "win_home": {
+        "label": "Home win", "show": "Home Win",
+        "market": "1X2", "pick": "Home", "search": "1X2",
+    },
+    "win_away": {
+        "label": "Away win", "show": "Away Win",
+        "market": "1X2", "pick": "Away", "search": "1X2",
+    },
+    "dc_1x": {
+        "label": "Home or draw", "show": "Home or Draw",
+        "market": "Double Chance", "pick": "Home or Draw", "search": "Double Chance",
+    },
+    "dc_x2": {
+        "label": "Draw or away", "show": "Draw or Away",
+        "market": "Double Chance", "pick": "Draw or Away", "search": "Double Chance",
+    },
+}
+
+# what the user's word means -> which concrete markets are tried
+GROUPS = {
+    "gg": ["gg"],
+    "over25": ["over25"],
+    "over15": ["over15"],
+    "win": ["win_home", "win_away"],
+    "dc": ["dc_1x", "dc_x2"],
+    "auto": ["gg", "over25", "over15", "win_home", "win_away", "dc_1x", "dc_x2"],
+}
+
+TITLES = {
+    "gg": "GG ticket", "over25": "Over 2.5 ticket", "over15": "Over 1.5 ticket",
+    "win": "Straight win ticket", "dc": "Double chance ticket", "auto": "Best picks ticket",
 }
 
 
-def score_market(key, h, a, loose=False):
+def venue_record(form, venue):
+    """Wins/draws/losses at home (H) or away (A); falls back to all matches if fewer than 3."""
+    r = form[venue]
+    return (r, True) if r["n"] >= 3 else (form["all"], False)
+
+
+def score_market(key, h, a, loose=False, odds=None):
     r = 0.1 if loose else 0.0          # how much to relax the thresholds
 
     if key == "gg":
@@ -462,10 +522,31 @@ def score_market(key, h, a, loose=False):
         score = (h["o25"] + a["o25"]) / 2
         thr = 0.60 - r
         ok = min(h["o25"], a["o25"]) >= 0.5 - r
-    else:
+    elif key == "over15":
         score = (h["o15"] + a["o15"]) / 2
         thr = 0.80 - r
         ok = min(h["o15"], a["o15"]) >= 0.7 - r
+    else:
+        hr, _ = venue_record(h, "H")      # home team's record at home
+        ar, _ = venue_record(a, "A")      # away team's record away
+        hn, an = max(hr["n"], 1), max(ar["n"], 1)
+
+        if key == "win_home":
+            score = 0.5 * hr["w"] / hn + 0.5 * ar["l"] / an
+            thr = 0.60 - r
+            ok = hr["w"] / hn >= 0.5 - r and (odds is None or 1.20 <= odds <= 2.10)
+        elif key == "win_away":
+            score = 0.5 * ar["w"] / an + 0.5 * hr["l"] / hn
+            thr = 0.60 - r
+            ok = ar["w"] / an >= 0.5 - r and (odds is None or 1.20 <= odds <= 2.40)
+        elif key == "dc_1x":
+            score = 0.5 * (hr["w"] + hr["d"]) / hn + 0.5 * (ar["d"] + ar["l"]) / an
+            thr = 0.80 - r
+            ok = (hr["w"] + hr["d"]) / hn >= 0.7 - r and (odds is None or odds >= 1.12)
+        else:  # dc_x2
+            score = 0.5 * (ar["w"] + ar["d"]) / an + 0.5 * (hr["d"] + hr["l"]) / hn
+            thr = 0.80 - r
+            ok = (ar["w"] + ar["d"]) / an >= 0.7 - r and (odds is None or odds >= 1.12)
 
     return {"score": score, "margin": score - thr, "strong": ok and score >= thr}
 
@@ -489,25 +570,63 @@ def reason_text(key, f, h, a):
             f"which supports Over 2.5."
         )
 
+    if key == "over15":
+        return (
+            f"{H} had 2+ goals in {h['o15c']}/{nh} of their last matches and {A} in "
+            f"{a['o15c']}/{na}. Both teams regularly play games with at least two goals, "
+            f"which supports Over 1.5."
+        )
+
+    hr, hv = venue_record(h, "H")
+    ar, av = venue_record(a, "A")
+    hw = "home games" if hv else "games"
+    aw = "away games" if av else "games"
+
+    if key == "win_home":
+        return (
+            f"{H} won {hr['w']}/{hr['n']} of their last {hw} (D{hr['d']} L{hr['l']}), while {A} "
+            f"lost {ar['l']}/{ar['n']} of their last {aw}. A strong host against a "
+            f"vulnerable visitor, which supports a {H} win."
+        )
+
+    if key == "win_away":
+        return (
+            f"{A} won {ar['w']}/{ar['n']} of their last {aw} (D{ar['d']} L{ar['l']}), while {H} "
+            f"lost {hr['l']}/{hr['n']} of their last {hw}. A strong visitor against a "
+            f"weak host, which supports an {A} win."
+        )
+
+    if key == "dc_1x":
+        return (
+            f"{H} did not lose {hr['w'] + hr['d']}/{hr['n']} of their last {hw}, and {A} "
+            f"failed to win {ar['d'] + ar['l']}/{ar['n']} of their last {aw}. "
+            f"That supports {H} or a draw."
+        )
+
     return (
-        f"{H} had 2+ goals in {h['o15c']}/{nh} of their last matches and {A} in "
-        f"{a['o15c']}/{na}. Both teams regularly play games with at least two goals, "
-        f"which supports Over 1.5."
+        f"{A} did not lose {ar['w'] + ar['d']}/{ar['n']} of their last {aw}, and {H} "
+        f"failed to win {hr['d'] + hr['l']}/{hr['n']} of their last {hw}. "
+        f"That supports {A} or a draw."
     )
 
 
 def evaluate(f, h, a, market, ev=None, loose=False):
     """f = display dict (names, league, kickoff). ev = SportyBet event, if known."""
 
-    keys = ["gg", "over25", "over15"] if market == "auto" else [market]
-
     best = None
 
-    for k in keys:
+    for k in GROUPS[market]:
+        odds = None
+
         # when we know the SportyBet event, only use markets it actually lists
-        if ev is not None and not sportybet.market_pick(ev, k):
-            continue
-        r = score_market(k, h, a, loose)
+        if ev is not None:
+            p = sportybet.market_pick(ev, k)
+            if not p:
+                continue
+            odds = p["odds"]
+
+        r = score_market(k, h, a, loose, odds)
+
         if best is None or r["margin"] > best["margin"]:
             best = {**r, "key": k}
 
@@ -622,10 +741,12 @@ def make_leg(c, ref, odds):
         "ref": ref,
         "market": spec["market"],
         "pick": spec["pick"],
+        "show": spec["show"],
         "odds": odds,
         "reason": reason_text(c["key"], f, c["h"], c["a"]),
         "league": f.get("league_name", ""),
         "kickoff_label": kick_time(f),
+        "kickoff_short": kick_short(f),
     }
 
 
@@ -669,15 +790,26 @@ def book_legs(legs, s):
 
 
 def format_legs(legs):
-    lines = []
+    blocks = []
+
     for i, x in enumerate(legs, 1):
-        lines.append(
-            f"{i}. {x['home']} vs {x['away']}\n"
-            f"   {x.get('league', '')} · {x.get('kickoff_label', '')}\n"
-            f"   {x['market']}: {x['pick']} @ {x['odds']:.2f}\n"
-            f"   {x['reason']}"
-        )
-    return "\n\n".join(lines)
+        when_txt = x.get("kickoff_short") or x.get("kickoff_label") or ""
+        place = " · ".join(p for p in (x.get("league", ""), when_txt) if p)
+        shown = x.get("show") or f"{x.get('market', '')} {x.get('pick', '')}".strip()
+
+        lines = [f"**{i}. {x['home']} vs {x['away']}**"]
+
+        if place:
+            lines.append(f"🌍 {place}")
+
+        lines.append(f"🎯 **{shown} @{x['odds']:.2f}**")
+
+        if x.get("reason"):
+            lines.append(f"> {x['reason']}")
+
+        blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks)
 
 
 def sa_fixtures(d):
@@ -717,19 +849,19 @@ def sb_window_events(d_from, d_to):
 def rank_events(evs, market, limit):
     """Order the events by how promising SportyBet's own odds make them (no SportAPI calls)."""
 
-    def odds_of(ev, key):
-        p = sportybet.market_pick(ev, key)
-        return p["odds"] if p else None
+    def lowest(ev, group):
+        odds = [p["odds"] for p in (sportybet.market_pick(ev, k) for k in GROUPS[group]) if p]
+        return min(odds) if odds else None
 
-    def proxy(ev, key):
-        o = odds_of(ev, key)
+    def proxy(ev, group):
+        o = lowest(ev, group)
         if o:
             return o
-        o25 = odds_of(ev, "over25")          # high-scoring games are good for GG and Over 1.5 too
-        return (o25 + 0.3) if o25 else 99
+        o25 = lowest(ev, "over25")           # high-scoring games are good for GG and Over 1.5 too
+        return (o25 + 0.3) if o25 and group in ("gg", "over15") else 99
 
-    keys = ["gg", "over25"] if market == "auto" else [market]
-    lists = [sorted(evs, key=lambda e, k=key: proxy(e, k)) for key in keys]
+    groups = ["gg", "over25", "win"] if market == "auto" else [market]
+    lists = [sorted(evs, key=lambda e, g=group: proxy(e, g)) for group in groups]
 
     out, seen = [], set()
 
@@ -895,26 +1027,34 @@ def build_ticket(t, s):
     s["slips"] = []
 
     # ---- 5. book it
+    title = TITLES.get(market, "Ticket")
+    total = prod(legs)
+
+    if count and len(legs) < count:
+        head = f"🎟 **{title} — {len(legs)} of {count} {when}, strongest picks only**"
+    else:
+        head = f"🎟 **{title} — {len(legs)} legs, {total} odds**"
+
     try:
         item = book_legs(legs, s)
-        code_line = f"🎟 BOOKING CODE: {item['code']}\n{item['games']} games · total odds {item['odds']}"
+        code_line = f"📋 Code: **{item['code']}** — {item['games']} games, {item['odds']} odds."
     except Exception as e:
         code_line = (
             f"Ticket built, but SportyBet booking failed: {type(e).__name__}: {e}\n"
-            f"Total odds {prod(legs)}"
+            f"Total odds {total}"
         )
 
     notes = []
 
     if count and len(legs) < count:
         notes.append(
-            f"Only {len(legs)} matches passed the stats check, not the {count} you asked for. "
-            f"I left the weak ones out on purpose. Say \"risky\" if you want me to relax the check."
+            f"Safe picks only take the strongest matches, so only {len(legs)} cleared, "
+            f"not the {count} you asked for. Say \"risky\" if you want me to relax the check."
         )
 
-    if target and prod(legs) < target * 0.9:
+    if target and total < target * 0.9:
         notes.append(
-            f"Total odds are {prod(legs)}, below your {target} target, because not enough "
+            f"Total odds are {total}, below your {target:g} target, because not enough "
             f"matches passed the stats check. Say \"risky\" to relax it."
         )
 
@@ -924,17 +1064,28 @@ def build_ticket(t, s):
             f"Ask again in a minute: what was loaded is remembered, so it will be faster."
         )
 
-    notes.append(
-        f"Checked the form of {checked} {league_label} matches ({total_found} on SportyBet for {when})"
-        + (f"; {no_stats} had no form data." if no_stats else ".")
-    )
+    parts = [head]
 
-    reply = code_line + "\n\n" + "\n".join(notes) + "\n\n" + format_legs(legs)
+    if notes:
+        parts.append("\n".join(notes))
+
+    parts.append(code_line)
+    parts.append("📊 **Picks**\n" + format_legs(legs))
+
+    reply = "\n\n".join(parts)
 
     if skipped:
         reply += "\n\nSkipped (strong stats, but no usable market on SportyBet):\n" + "\n".join(skipped[:5])
 
-    reply += "\n\nSay \"convert to Bet9ja\" (or MSport, BetNaija...) to move this code."
+    scope = "" if league_label == "all leagues" else f"{league_label} "
+
+    reply += (
+        f"\n\nChecked the form of {checked} {scope}matches "
+        f"({total_found} on SportyBet for {when})"
+        + (f"; {no_stats} had no form data." if no_stats else ".")
+    )
+
+    reply += "\nSay \"receipt\" for a shareable image, or \"convert to Bet9ja\" to move this code."
 
     return reply
 
@@ -1090,7 +1241,7 @@ def do_book(s):
     except Exception as e:
         return f"SportyBet booking failed: {type(e).__name__}: {e}"
 
-    return f"🎟 BOOKING CODE: {item['code']}\n{item['games']} games · total odds {item['odds']}"
+    return f"📋 Code: **{item['code']}** — {item['games']} games, {item['odds']} odds."
 
 
 def do_remove(t, s):
@@ -1133,12 +1284,15 @@ def help_text(lead=""):
         (lead + "\n\n" if lead else "")
         + "I build tickets from real form stats and give you the booking code. Try:\n\n"
         "• Give me 10 matches that can play GG from today's European competitions\n"
-        "• Give me 25 odds from tomorrow's Premier League\n"
+        "• Straight win 10 matches today\n"
+        "• Double chance 5 matches tomorrow\n"
         "• Over 2.5 picks for the weekend\n"
-        "• Paste a booking code to read it\n"
-        "• convert MX96ZD to Bet9ja\n"
-        "• convert this to MSport (uses your last code)\n"
+        "• Give me your best 10 odds (mixes every market I know)\n"
+        "• Add \"risky\" to relax the stats check\n"
+        "• receipt (makes the shareable image of your ticket)\n"
+        "• Paste a booking code to read it, or: convert this to Bet9ja\n"
         "• remove leg 3 / remove odds below 1.2 / book this ticket\n\n"
+        "Markets I can build from stats right now: GG, Over 1.5, Over 2.5, straight win, double chance.\n"
         f"Bookmakers: {names}"
     )
 
