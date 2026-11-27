@@ -505,6 +505,29 @@ def find_selection(markets, key):
     return None
 
 
+def warm_sportybet():
+    """Load SportyBet's event list once. Returns '' if OK, otherwise the reason it failed."""
+
+    fn = getattr(sportybet, "_events", None)
+
+    if fn is None:
+        return ""
+
+    ex = ThreadPoolExecutor(max_workers=1)
+    fu = ex.submit(fn, "football")
+    done, _ = wait([fu], timeout=MARKET_BUDGET)
+    ex.shutdown(wait=False)
+
+    if not done:
+        return "SportyBet did not answer in time"
+
+    try:
+        fu.result()
+        return ""
+    except Exception as e:
+        return str(e) or type(e).__name__
+
+
 def lookup_leg(c):
     """Find the SportyBet selection for one candidate. Returns (candidate, leg_or_None, why)."""
 
@@ -633,21 +656,26 @@ def build_ticket(t, s):
     # look up real SportyBet odds for the best candidates (in parallel)
     top = cands[: (count + 4) if count else 15]
 
-    ex = ThreadPoolExecutor(max_workers=5)
-    futs = [ex.submit(lookup_leg, c) for c in top]
-    done, pending = wait(futs, timeout=MARKET_BUDGET)
-    ex.shutdown(wait=False, cancel_futures=True)
+    sb_error = warm_sportybet()
 
     looked = []
 
-    for c, fu in zip(top, futs):
-        if fu in done:
-            try:
-                looked.append(fu.result())
-            except Exception as e:
-                looked.append((c, None, f"error ({type(e).__name__})"))
-        else:
-            looked.append((c, None, "SportyBet was too slow"))
+    if sb_error:
+        looked = [(c, None, sb_error) for c in top]
+    else:
+        ex = ThreadPoolExecutor(max_workers=3)
+        futs = [ex.submit(lookup_leg, c) for c in top]
+        done, pending = wait(futs, timeout=MARKET_BUDGET)
+        ex.shutdown(wait=False, cancel_futures=True)
+
+        for c, fu in zip(top, futs):
+            if fu in done:
+                try:
+                    looked.append(fu.result())
+                except Exception as e:
+                    looked.append((c, None, f"error ({type(e).__name__})"))
+            else:
+                looked.append((c, None, "SportyBet was too slow"))
 
     legs, skipped = [], []
 
@@ -677,13 +705,19 @@ def build_ticket(t, s):
                 f"   {reason_text(c['key'], f, c['h'], c['a'])}"
             )
 
+        why = sb_error or (skipped[0].split(": ", 1)[-1] if skipped else "SportyBet gave no data")
+
         return (
             "The stats check worked, but SportyBet did not return any odds, so I cannot "
             "make a booking code right now. These are the matches that passed:\n\n"
             + "\n\n".join(picks)
-            + "\n\nWhy no code: " + (skipped[0].split(": ", 1)[-1] if skipped else "SportyBet gave no data")
-            + ". If your server log shows \"SPORTYBET ERROR: HTTP 202\", SportyBet is not "
-              "answering requests from this server."
+            + "\n\nWhy no code: " + why
+            + (
+                "\n\nSportyBet is blocking this server's connection. Run BetOracle on your own "
+                "computer (home internet), or set a SPORTYBET_PROXY on Render."
+                if any(w in why.lower() for w in ("blocking", "bot protection", "202"))
+                else ""
+            )
         )
 
     s["ticket"][:] = legs
