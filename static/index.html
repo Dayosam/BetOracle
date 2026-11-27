@@ -16,29 +16,36 @@ main{flex:1;overflow-y:auto;width:100%;max-width:780px;margin:0 auto;padding:18p
 .hero svg{width:108px;height:108px;filter:drop-shadow(0 10px 28px rgba(11,31,58,.18))}
 .hero h2{font:800 28px Archivo,system-ui,sans-serif;margin:14px 0 4px;letter-spacing:-.02em}
 .hero p{color:var(--mute);margin:0 auto;max-width:340px}
-.sports{display:flex;gap:6px;overflow-x:auto;padding:0 16px 8px;max-width:780px;width:100%;margin:0 auto}
-.sports button,.act button{white-space:nowrap;background:var(--panel);border:1px solid var(--line);color:var(--ink);border-radius:99px;padding:7px 14px;font:inherit;font-size:14px;cursor:pointer}
-.sports button:hover,.act button:hover{border-color:var(--violet)}
-.m{max-width:86%;padding:10px 14px;border-radius:16px;white-space:pre-wrap}
+.act button{white-space:nowrap;background:var(--panel);border:1px solid var(--line);color:var(--ink);border-radius:99px;padding:7px 14px;font:inherit;font-size:14px;cursor:pointer}
+.act button:hover{border-color:var(--violet)}
+.m{max-width:92%;padding:10px 14px;border-radius:16px;white-space:pre-wrap;overflow-wrap:anywhere}
+.m b{font-weight:700}
+.qt{display:block;border-left:3px solid #C5CBD6;padding:2px 0 2px 12px;margin:4px 0 2px;color:#4B5563}
 .u{align-self:flex-end;background:var(--violet);color:#fff;border-bottom-right-radius:4px}
 .a{align-self:flex-start;background:var(--panel);border:1px solid var(--line);border-bottom-left-radius:4px}
 .err{border-color:var(--gold);color:var(--gold)}
 .dots{color:var(--mute)}
 .slip{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--gold);border-radius:10px;padding:12px 14px}
 .slip h3{font:800 15px Archivo,system-ui,sans-serif;margin:0 0 6px}
-.pick{padding:9px 0;border-top:1px dashed var(--line)}.pick b{font-weight:500}
+.pick{padding:7px 0;border-top:1px dashed var(--line);font-size:15px}.pick b{font-weight:500}
 .pick .o{float:right;color:var(--ink);font-weight:500;font-variant-numeric:tabular-nums}
-.pick p{margin:3px 0 0;color:var(--mute);font-size:14px}
 .tot{display:flex;justify-content:space-between;border-top:1px solid var(--ink);margin-top:4px;padding-top:8px;font-weight:500}
 .tot span:last-child{color:var(--win);font-variant-numeric:tabular-nums}
 .act{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
 .act .book{background:var(--gold);color:#fff;border-color:var(--gold);font-weight:500}
-.code{display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px}.code b{font:700 18px ui-monospace,Menlo,monospace;letter-spacing:.06em}.code span{color:var(--mute);font-size:14px}.code button{margin-left:auto;background:var(--ink);color:#fff;border:0;border-radius:8px;padding:6px 12px;font:inherit;font-size:14px;cursor:pointer}
+.code{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px}.code b{font:700 18px ui-monospace,Menlo,monospace;letter-spacing:.06em}.code span{color:var(--mute);font-size:14px}.code button{background:var(--ink);color:#fff;border:0;border-radius:8px;padding:6px 12px;font:inherit;font-size:14px;cursor:pointer}.code .push{margin-left:auto}
 form{display:flex;gap:8px;width:100%;max-width:780px;margin:0 auto;padding:8px 16px calc(14px + env(safe-area-inset-bottom))}
 input{flex:1;min-width:0;padding:13px 15px;border-radius:12px;border:1px solid var(--line);background:var(--panel);color:var(--ink);font:inherit}
 form>button{background:var(--gold);color:#fff;border:0;border-radius:12px;padding:0 20px;font:inherit;font-weight:500;cursor:pointer}
 form>button:disabled{opacity:.5;cursor:not-allowed}
 button:focus-visible,input:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+#rc{position:fixed;inset:0;background:rgba(3,12,20,.92);z-index:50;display:none;flex-direction:column;align-items:center;overflow:auto;padding:calc(16px + env(safe-area-inset-top)) 14px calc(20px + env(safe-area-inset-bottom))}
+#rc.on{display:flex}
+#rc img{width:100%;max-width:520px;height:auto;border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,.5)}
+.rb{display:flex;gap:10px;margin-top:14px;width:100%;max-width:520px}
+.rb button{flex:1;padding:13px;border-radius:12px;border:0;font:inherit;font-weight:500;cursor:pointer}
+.rb .go{background:var(--gold);color:#fff}.rb .no{background:#fff;color:var(--ink)}
+.rh{color:#9fb0c3;font-size:13px;margin-top:8px;text-align:center}
 </style></head><body>
 <svg width="0" height="0" style="position:absolute"><defs>
 <symbol id="bo" viewBox="0 0 200 200"><circle cx="100" cy="100" r="96" fill="#fff"/><mask id="bocut" maskUnits="userSpaceOnUse" x="-60" y="-60" width="320" height="220"><rect x="-60" y="-60" width="320" height="220" fill="#fff"/><path d="M131-2L141 3L128 36L118 31Z" fill="#000"/></mask><g transform="translate(100 100) scale(.9) translate(-66 -50) skewX(-12)"><path d="M0 0H44C62 0 72 10 72 26C72 36 67 43 59 47C70 51 77 60 77 74C77 91 65 100 46 100H0ZM26 20V40H40C46 40 48 36 48 30C48 24 46 20 40 20ZM26 60V80H42C50 80 53 76 53 70C53 64 50 60 42 60Z" fill="#0B1F3A" fill-rule="evenodd"/><path d="M70 50a42 50 0 1 0 84 0a42 50 0 1 0-84 0ZM94 52a18 26 0 1 0 36 0a18 26 0 1 0-36 0Z" fill="#E63A2E" stroke="#fff" stroke-width="6" stroke-linejoin="round" paint-order="stroke" fill-rule="evenodd" mask="url(#bocut)"/></g></symbol></defs></svg>
@@ -48,49 +55,157 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--gold);outline-o
   <h2>Your AI betting co-pilot.</h2><p>Predictions · Slip checks · Code conversion<br><small style="color:var(--mute)">MSport · Bet9ja · Paripesa · BetNaija · Afropari · Betway · 1xBet</small></p></div>
 </main>
 <form id="f"><input id="i" placeholder="Tell BetOracle what to do" autocomplete="off"><button id="s">Send</button></form>
+<div id="rc"><img id="rimg" alt="Ticket receipt"><div class="rb"><button class="go" id="rgo">Share / Save</button><button class="no" id="rno">Close</button></div><div class="rh">On iPhone you can also press and hold the image, then tap Save.</div></div>
 <script>
 const log=document.getElementById('log'),inp=document.getElementById('i'),btn=document.getElementById('s'),sid=Math.random().toString(36).slice(2);
-let slipEl=null,shown=0,busy=false;
+let slipEl=null,shown=0,busy=false,lastTicket=[],lastCode='';
+
+/* ---------- chat text: **bold** and "> quote" lines (escaped first, so it is safe) ---------- */
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function fmt(t){
+ const b=s=>s.replace(/\*\*(.+?)\*\*/g,'<b>$1</b>');
+ let out='';
+ String(t).split('\n').forEach((line,i,all)=>{
+  const nl=i<all.length-1?'\n':'';
+  if(line.startsWith('> '))out+='<span class="qt">'+b(esc(line.slice(2)))+'</span>';
+  else out+=b(esc(line))+nl;
+ });
+ return out}
 
 function add(cls,t){const d=document.createElement('div');d.className='m '+cls;d.textContent=t;log.append(d);log.scrollTop=log.scrollHeight;return d}
+
+function pickLabel(x){return x.show||[x.market,x.pick].filter(Boolean).join(': ')}
 
 function slip(t){
  if(slipEl)slipEl.remove();if(!t.length)return;
  slipEl=document.createElement('div');slipEl.className='slip';
  const h=document.createElement('h3');h.textContent='Your ticket';slipEl.append(h);
  t.forEach(x=>{const p=document.createElement('div');p.className='pick';
-  const o=document.createElement('span');o.className='o';o.textContent=x.odds;
-  const b=document.createElement('b');b.textContent=`${x.home} v ${x.away}: ${x.market}, ${x.pick}`;
-  const r=document.createElement('p');r.textContent=x.reason;p.append(o,b,r);slipEl.append(p)});
+  const o=document.createElement('span');o.className='o';o.textContent=Number(x.odds).toFixed(2);
+  const b=document.createElement('b');b.textContent=`${x.home} v ${x.away}: ${pickLabel(x)}`;
+  p.append(o,b);slipEl.append(p)});
  const f=document.createElement('div');f.className='tot';f.innerHTML='<span>Total odds</span><span></span>';
  f.lastChild.textContent=t.reduce((p,x)=>p*x.odds,1).toFixed(2);slipEl.append(f);
  const a=document.createElement('div');a.className='act';
- const bk=document.createElement('button');bk.className='book';bk.textContent='Book on SportyBet';bk.onclick=()=>send('Book this ticket on SportyBet');a.append(bk);
- slipEl.append(a);log.append(slipEl);log.scrollTop=log.scrollHeight}
+ const bk=document.createElement('button');bk.className='book';bk.textContent='Book on SportyBet';bk.onclick=()=>send('Book this ticket on SportyBet');
+ const rc=document.createElement('button');rc.textContent='🧾 Receipt';rc.onclick=()=>openReceipt();
+ a.append(bk,rc);slipEl.append(a);log.append(slipEl);log.scrollTop=log.scrollHeight}
 
 function codes(list){
  list.slice(shown).forEach(c=>{const d=document.createElement('div');d.className='code';
   const b=document.createElement('b');b.textContent=c.code;const m=document.createElement('span');m.textContent=`${c.games} games, ${c.odds} odds`;
   const k=document.createElement('button');k.textContent='Copy';k.onclick=()=>{navigator.clipboard?.writeText(c.code);k.textContent='Copied';setTimeout(()=>k.textContent='Copy',1500)};
-  d.append(b,m,k);log.append(d)});shown=list.length;log.scrollTop=log.scrollHeight}
+  const r=document.createElement('button');r.className='push';r.textContent='🧾 Receipt';r.onclick=()=>openReceipt(c.code);
+  d.append(b,m,k,r);log.append(d)});shown=list.length;log.scrollTop=log.scrollHeight}
 
+/* ---------- receipt image (drawn in the browser, no server needed) ---------- */
+const BRAND={name:'BetOracle',tld:'.ai',tag:'Stats-backed picks. Smarter slips.',handle:'betoracle.onrender.com'};
+const FONT='Archivo, Inter, system-ui, -apple-system, Arial, sans-serif';
+const EMOJI='"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif';
+const LOGO_SVG='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200"><circle cx="100" cy="100" r="96" fill="#fff"/><mask id="m" maskUnits="userSpaceOnUse" x="-60" y="-60" width="320" height="220"><rect x="-60" y="-60" width="320" height="220" fill="#fff"/><path d="M131-2L141 3L128 36L118 31Z" fill="#000"/></mask><g transform="translate(100 100) scale(.9) translate(-66 -50) skewX(-12)"><path d="M0 0H44C62 0 72 10 72 26C72 36 67 43 59 47C70 51 77 60 77 74C77 91 65 100 46 100H0ZM26 20V40H40C46 40 48 36 48 30C48 24 46 20 40 20ZM26 60V80H42C50 80 53 76 53 70C53 64 50 60 42 60Z" fill="#0B1F3A" fill-rule="evenodd"/><path d="M70 50a42 50 0 1 0 84 0a42 50 0 1 0-84 0ZM94 52a18 26 0 1 0 36 0a18 26 0 1 0-36 0Z" fill="#E63A2E" stroke="#fff" stroke-width="6" stroke-linejoin="round" paint-order="stroke" fill-rule="evenodd" mask="url(#m)"/></g></svg>';
+
+function rr(x,px,py,w,h,r){x.beginPath();x.moveTo(px+r,py);x.arcTo(px+w,py,px+w,py+h,r);x.arcTo(px+w,py+h,px,py+h,r);x.arcTo(px,py+h,px,py,r);x.arcTo(px,py,px+w,py,r);x.closePath()}
+function fit(x,text,maxW){if(x.measureText(text).width<=maxW)return text;let t=text;while(t.length>3&&x.measureText(t+'…').width>maxW)t=t.slice(0,-1);return t.trimEnd()+'…'}
+function ordinal(n){const s=['TH','ST','ND','RD'],v=n%100;return n+(s[(v-20)%10]||s[v]||s[0])}
+function lagosDate(){
+ try{const p=new Intl.DateTimeFormat('en-US',{month:'long',day:'numeric',timeZone:'Africa/Lagos'}).formatToParts(new Date());
+  const m=p.find(q=>q.type==='month').value,d=parseInt(p.find(q=>q.type==='day').value,10);return (m+' '+ordinal(d)).toUpperCase()}
+ catch(e){const d=new Date();return d.toLocaleString('en-US',{month:'long'}).toUpperCase()+' '+ordinal(d.getDate())}}
+function kickTime(iso){try{const d=new Date(iso);if(isNaN(d))return '';return d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',timeZone:'Africa/Lagos'})}catch(e){return ''}}
+function loadImg(src){return new Promise(r=>{const i=new Image();i.onload=()=>r(i);i.onerror=()=>r(null);i.src=src})}
+
+async function buildReceipt(legs,code){
+ try{await Promise.all(['800 40px Archivo','700 30px Archivo','italic 800 40px Archivo'].map(f=>document.fonts.load(f)))}catch(e){}
+ const logo=await loadImg('data:image/svg+xml;charset=utf-8,'+encodeURIComponent(LOGO_SVG));
+ const MAXR=12,n=Math.min(legs.length,MAXR),extra=legs.length-n;
+ const W=1565,lastSep=470+110*(n-1),panelTop=lastSep+37,cardBottom=panelTop+136+20,H=cardBottom+155;
+ const c=document.createElement('canvas');c.width=W;c.height=H;const x=c.getContext('2d');
+ const NAVY='#04141F',RED='#FF2222',DRED='#7B0711',INK='#07182A',MUTE='#4B5563',LINE='#D7DCE5',slope=0.107;
+
+ // background: navy with a red wedge on the right and a dark-red stripe
+ x.fillStyle=NAVY;x.fillRect(0,0,W,H);
+ x.fillStyle=RED;x.beginPath();x.moveTo(975,0);x.lineTo(W,0);x.lineTo(W,H);x.lineTo(975+slope*H,H);x.closePath();x.fill();
+ x.fillStyle=DRED;x.beginPath();x.moveTo(1095,0);x.lineTo(1245,0);x.lineTo(1245+slope*H,H);x.lineTo(1095+slope*H,H);x.closePath();x.fill();
+ x.fillStyle=RED;x.fillRect(0,0,W,12);
+
+ // logo + name
+ if(logo)x.drawImage(logo,96,44,118,118);
+ x.textBaseline='alphabetic';x.textAlign='left';
+ x.font='italic 800 56px '+FONT;x.fillStyle='#fff';x.fillText(BRAND.name,232,128);
+ const nw=x.measureText(BRAND.name).width;x.fillStyle=RED;x.fillText(BRAND.tld,232+nw,128);
+
+ // date pill
+ const date=lagosDate();x.font='800 31px '+FONT;
+ const pw=Math.max(328,x.measureText(date).width+76),px=1466-pw;
+ x.fillStyle='#fff';rr(x,px,110,pw,75,37.5);x.fill();
+ x.fillStyle=INK;x.textAlign='center';x.textBaseline='middle';x.fillText(date,px+pw/2,149);
+
+ // title
+ x.textAlign='left';x.textBaseline='alphabetic';x.fillStyle='#fff';x.font='800 60px '+FONT;x.fillText('PREDICTIONS OF THE DAY',98,252);
+ x.fillStyle=RED;rr(x,98,264,310,8,4);x.fill();
+
+ // white card
+ x.fillStyle='#fff';rr(x,97,322,1371,cardBottom-322,62);x.fill();x.strokeStyle=LINE;x.lineWidth=2;x.stroke();
+
+ // rows
+ for(let i=0;i<n;i++){
+  const L=legs[i],ty=398+110*i;
+  x.textBaseline='middle';x.textAlign='center';x.font='40px '+EMOJI;x.fillStyle=INK;x.fillText('⚽',163,ty);
+  x.textAlign='left';x.font='800 37px '+FONT;x.fillStyle=INK;x.fillText(fit(x,`${L.home} vs ${L.away}`,1010),220,ty);
+  x.font='700 30px '+FONT;x.fillStyle=MUTE;x.fillText(fit(x,pickLabel(L),1010),220,ty+44);
+  x.fillStyle=NAVY;rr(x,1262,ty-26,166,46,23);x.fill();
+  x.fillStyle='#fff';x.textAlign='center';x.font='800 31px '+FONT;x.fillText(Number(L.odds).toFixed(2),1345,ty-2);
+  x.fillStyle='#6B7280';x.font='700 25px '+FONT;x.fillText(kickTime(L.kickoff),1345,ty+49);
+  x.strokeStyle=LINE;x.lineWidth=2;x.beginPath();x.moveTo(136,ty+72);x.lineTo(1428,ty+72);x.stroke();
+ }
+
+ // combined odds panel
+ const total=legs.reduce((p,l)=>p*Number(l.odds),1);
+ const totalTxt=total>=100?String(Math.round(total)):String(parseFloat(total.toFixed(2)));
+ x.fillStyle='#F4F6F9';rr(x,136,panelTop,1292,136,38);x.fill();
+ x.textAlign='left';x.textBaseline='middle';x.fillStyle=INK;x.font='800 34px '+FONT;x.fillText('COMBINED ODDS',182,panelTop+50);
+ const sub=[code?'CODE '+code:'',extra>0?'+'+extra+' MORE LEG'+(extra>1?'S':'')+' COLLAPSED':''].filter(Boolean).join('  ·  ')||legs.length+' LEG'+(legs.length>1?'S':'');
+ x.fillStyle='#6B7280';x.font='700 24px '+FONT;x.fillText(sub,182,panelTop+98);
+ const tw=Math.max(195,(x.font='800 52px '+FONT,x.measureText(totalTxt).width)+70);
+ x.fillStyle=RED;rr(x,1390-tw,panelTop+33,tw,70,35);x.fill();
+ x.fillStyle='#fff';x.textAlign='center';x.font='800 52px '+FONT;x.fillText(totalTxt,1390-tw/2,panelTop+69);
+
+ // footer
+ x.textBaseline='alphabetic';x.fillStyle='#fff';x.textAlign='left';x.font='800 38px '+FONT;x.fillText(BRAND.tag,98,cardBottom+100);
+ x.textAlign='right';x.font='800 36px '+FONT;x.fillText(BRAND.handle,1467,cardBottom+100);
+ return c}
+
+let rcBlob=null;
+async function openReceipt(code){
+ const legs=lastTicket;
+ if(!legs.length){add('a','Build a ticket first, then say "receipt".');return}
+ const c=await buildReceipt(legs,code||lastCode);
+ c.toBlob(b=>{rcBlob=b;document.getElementById('rimg').src=URL.createObjectURL(b);document.getElementById('rc').classList.add('on')},'image/png')}
+document.getElementById('rno').onclick=()=>document.getElementById('rc').classList.remove('on');
+document.getElementById('rgo').onclick=async()=>{
+ if(!rcBlob)return;
+ const file=new File([rcBlob],'betoracle-receipt.png',{type:'image/png'});
+ try{if(navigator.canShare&&navigator.canShare({files:[file]})){await navigator.share({files:[file],title:'BetOracle ticket'});return}}catch(e){if(e&&e.name==='AbortError')return}
+ const a=document.createElement('a');a.href=URL.createObjectURL(rcBlob);a.download='betoracle-receipt.png';document.body.append(a);a.click();a.remove()};
+
+/* ---------- sending messages ---------- */
 function setBusy(v){busy=v;btn.disabled=v}
 
 function errText(r,d){
- // FastAPI sends {detail: "..."}; Render's own gateway errors are HTML (no JSON)
  let msg='';
  if(d&&d.detail)msg=typeof d.detail==='string'?d.detail:JSON.stringify(d.detail);
  if(!msg){
   msg=(r.status===502||r.status===504)
-   ?'The server took too long or the gateway failed. Try a more specific request, e.g. "2 odds from Europa League tonight".'
+   ?'The server took too long or the gateway failed. Try a more specific request, e.g. "5 GG matches today".'
    :'Server error. Please try again.';
  }
  return `Error ${r.status}: ${msg}`}
 
 async function send(msg){
  if(busy)return;
- setBusy(true);
  document.getElementById('hero')?.remove();
+ if(/^\s*(receipt|make (a |the )?receipt|generate (a |the )?receipt|ticket image|slip image|image)\s*$/i.test(msg)){add('u',msg);openReceipt();return}
+ setBusy(true);
  add('u',msg);const w=add('a dots','Thinking…');
  try{
   const ctl=new AbortController();
@@ -103,11 +218,13 @@ async function send(msg){
   try{d=await r.json()}catch(_){d=null}
   if(!r.ok){w.className='m a err';w.textContent=errText(r,d);return}
   w.className='m a';
-  w.textContent=(d&&d.reply)||'The AI returned no text. Please try again.';
-  codes((d&&d.codes)||[]);slip((d&&d.ticket)||[])
+  w.innerHTML=fmt((d&&d.reply)||'The server returned no text. Please try again.');
+  lastTicket=(d&&d.ticket)||[];
+  const cl=(d&&d.codes)||[];if(cl.length)lastCode=cl[cl.length-1].code;
+  codes(cl);slip(lastTicket)
  }catch(e){
   w.className='m a err';w.textContent=(e&&e.name==='AbortError')
-   ?'That took too long and was stopped. Try again in a minute (loaded stats are cached, so it will be faster).'
+   ?'That took too long and was stopped. Try again in a minute (loaded stats are remembered, so it will be faster).'
    :'Cannot reach the server. Check your connection and try again.'
  }finally{setBusy(false)}
 }
