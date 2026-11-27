@@ -1,26 +1,28 @@
-import os
-import json
-import math
-import re
-import time
-import threading
-import traceback
-import httpx
-import concurrent.futures
+"""
+BetOracle: no AI, no Groq.
+The server reads what the user types with simple rules, checks real form
+stats from sportapi, picks the strongest matches, books them on SportyBet
+and returns the booking code. It can also read and convert booking codes.
+"""
 
-from datetime import date
+import os
+import re
+import math
+import traceback
+import unicodedata
+
+from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
+
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import sportybet
 import sportapi
-import corners
 import bookmakers
-import msport
 import convert_router as router
-import prediction_engine
 
 from cache import count_call
 
@@ -31,951 +33,844 @@ from cache import count_call
 
 load_dotenv()
 
-# GROQ IS TEMPORARILY DISABLED
-# Change to True when you want to restore Groq.
-GROQ_ENABLED = False
+MAX_ANALYSE = int(os.getenv("MAX_ANALYSE", "40"))   # max matches to analyse per request
+FORM_N = 10                                         # last N finished matches per team
+MIN_FORM = 6                                        # need at least this many matches of data
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
-
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-MAX_STEPS = int(os.getenv("AI_MAX_STEPS", "5"))
-MAX_HISTORY = int(os.getenv("AI_HISTORY_LIMIT", "10"))
-TOOL_RESULT_LIMIT = int(os.getenv("AI_TOOL_RESULT_LIMIT", "1800"))
-
-MAX_OUT = int(os.getenv("GROQ_MAX_OUT", "700"))
-
-GROQ_TIMEOUT = float(os.getenv("GROQ_TIMEOUT_SECONDS", "20"))
-GROQ_RETRIES = int(os.getenv("GROQ_RETRIES", "1"))
-
-PLATFORMS = list(bookmakers.BOOKMAKERS)
+WAT = timezone(timedelta(hours=1))                  # Nigeria time
 
 SESSIONS = {}
 
-SESSION_LOCKS = {}
-SESSION_LOCKS_GUARD = threading.Lock()
+
+# =========================================================
+# SMALL HELPERS
+# =========================================================
+
+def prod(legs):
+    return round(math.prod(x["odds"] for x in legs), 2) if legs else 0
 
 
-def get_session_lock(session_id):
+def norm(x):
+    return re.sub(r"[^a-z0-9]", "", str(x).lower())
 
-    with SESSION_LOCKS_GUARD:
 
-        if session_id not in SESSION_LOCKS:
+def slugify(name):
+    s = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
 
-            SESSION_LOCKS[session_id] = threading.Lock()
 
-        return SESSION_LOCKS[session_id]
+def today():
+    return datetime.now(WAT).date()
+
+
+def kick_time(f):
+    raw = f.get("kickoff_utc") or ""
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(WAT).strftime("%a %d %b, %I:%M %p")
+    except Exception:
+        return raw
 
 
 # =========================================================
-# PREDICTION REQUEST DETECTION
+# READING THE USER'S MESSAGE
 # =========================================================
 
-def detect_prediction_request(message):
+def parse_dates(t):
+    d = today()
 
-    text = message.lower().strip()
+    if "tomorrow" in t:
+        d = d + timedelta(days=1)
+        return d, d, "tomorrow"
 
-    excluded = [
-        "why did you choose",
-        "why did you select",
-        "explain your prediction",
-        "explain this pick",
-        "analyse this",
-        "analyze this",
-        "convert",
-        "booking code",
-        "book this ticket",
-        "book my ticket",
-        "remove",
-        "replace",
-        "clear my ticket",
-        "edit my ticket",
-        "change my ticket",
-        "what does this mean",
-        "how does this work"
-    ]
+    if "weekend" in t:
+        wd = d.weekday()
+        if wd == 6:
+            return d, d, "this weekend"
+        sat = d + timedelta(days=(5 - wd) % 7)
+        return sat, sat + timedelta(days=1), "this weekend"
 
-    if any(word in text for word in excluded):
-        return None
+    return d, d, "today"
 
-    patterns = [
-        r"(?:give me|get me|find|show me|generate)\s+(\d+)\s+(?:best\s+)?(?:predictions|picks|tips|odds)",
-        r"(?:best|strongest)\s+(\d+)\s+(?:predictions|picks|tips)",
-        r"(\d+)\s+(?:best\s+)?(?:predictions|picks|tips)\s+(?:for|from|tonight|today)"
-    ]
 
-    for pattern in patterns:
+def parse_market(t):
+    if re.search(r"\b(gg|btts|bts|both teams|both team)\b", t):
+        return "gg"
+    if re.search(r"\bover\s*2\.?5\b|\bo2\.?5\b", t):
+        return "over25"
+    if re.search(r"\bover\s*1\.?5\b|\bo1\.?5\b", t):
+        return "over15"
+    return None
 
-        match = re.search(pattern, text)
 
-        if match:
+def parse_numbers(t):
+    """Returns (count, target_odds). Either can be None."""
 
-            return {
-                "count": min(int(match.group(1)), 20),
-                "league": None
-            }
+    target = None
+    count = None
 
-    general_requests = [
-        "give me predictions",
-        "best predictions",
-        "strongest picks",
-        "today's predictions",
-        "tonight's predictions",
-        "give me your best picks",
-        "find the best picks"
-    ]
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:total\s*)?odds?\b", t)
+    if m:
+        target = float(m.group(1))
 
-    if any(term in text for term in general_requests):
+    m = re.search(
+        r"\b(\d{1,2})\s*(?:best\s*|safe\s*|strong\s*)?"
+        r"(?:matches|match|games|game|picks|pick|legs|leg|teams|selections|fixtures)\b",
+        t
+    )
+    if m:
+        count = int(m.group(1))
 
-        return {
-            "count": 2,
-            "league": None
-        }
+    return count, target
+
+
+EXCLUDE = (
+    "caf", "afc", "concacaf", "conmebol", "women",
+    "u17", "u19", "u20", "u21", "u23", "youth"
+)
+
+LEAGUE_GROUPS = [
+    (("europa league",), ("europa league",), "Europa League"),
+    (("conference league",), ("conference league", "europa conference"), "Conference League"),
+    (("champions league",), ("champions league",), "Champions League"),
+    (("european", "europe", "uefa", "euro comp"),
+     ("champions league", "europa league", "conference league", "europa conference"),
+     "European competitions"),
+]
+
+TOP_LEAGUES = {
+    "premier league": ("premier league", "english premier league"),
+    "la liga": ("la liga", "laliga"),
+    "serie a": ("serie a",),
+    "bundesliga": ("bundesliga",),
+    "ligue 1": ("ligue 1",),
+    "eredivisie": ("eredivisie",),
+    "championship": ("championship", "efl championship"),
+}
+
+
+def mentions_league(t):
+    for triggers, _, _ in LEAGUE_GROUPS:
+        if any(k in t for k in triggers):
+            return True
+    return any(k in t for k in TOP_LEAGUES)
+
+
+def pick_leagues(t, fixtures):
+    """Filter fixtures by the league the user mentioned. Returns (fixtures, label)."""
+
+    for triggers, words, label in LEAGUE_GROUPS:
+        if any(k in t for k in triggers):
+            out = []
+            for f in fixtures:
+                n = f.get("league_name", "").lower()
+                if any(w in n for w in words) and not any(x in n for x in EXCLUDE):
+                    out.append(f)
+            return out, label
+
+    for key, variants in TOP_LEAGUES.items():
+        if key in t:
+            return [f for f in fixtures if f.get("league_name", "").lower() in variants], key.title()
+
+    names = {f.get("league_name", "") for f in fixtures}
+    hit = [n for n in names if len(n) >= 5 and n.lower() in t]
+    if hit:
+        return [f for f in fixtures if f.get("league_name") in hit], ", ".join(hit)
+
+    return fixtures, "all leagues"
+
+
+# ---- bookmakers and booking codes ----
+
+def bookmaker_aliases():
+    out = []
+    for key, v in bookmakers.BOOKMAKERS.items():
+        label = v.get("label", key) if isinstance(v, dict) else key
+        al = {norm(key), norm(label), norm(label.split()[0])}
+        if "sporty" in norm(key) or "sporty" in norm(label):
+            al.add("sporty")
+        out.append((key, {a for a in al if len(a) >= 4}))
+    return out
+
+
+def detect_bookmaker(t):
+    """Find which bookmaker the user means. Text after ' to ' wins."""
+
+    parts = re.split(r"\bto\b|\bon\b|\binto\b", t)
+    zones = [parts[-1], t] if len(parts) > 1 else [t]
+
+    for zone in zones:
+        n = norm(zone)
+        best = None
+        for key, al in bookmaker_aliases():
+            for a in al:
+                if a in n and (best is None or len(a) > best[1]):
+                    best = (key, len(a))
+        if best:
+            return best[0]
+    return None
+
+
+def detect_code(text):
+    all_aliases = set()
+    for _, al in bookmaker_aliases():
+        all_aliases |= al
+
+    for tok in re.findall(r"\b[A-Za-z0-9]{5,12}\b", text):
+        if norm(tok) in all_aliases:
+            continue
+        if tok.lower() in ("over25", "over15", "under25"):
+            continue
+        if re.search(r"\d", tok) and re.search(r"[A-Za-z]", tok):
+            return tok.upper()
+
+    m = re.search(r"code[:\s]+([A-Za-z0-9]{5,12})\b", text, re.I)
+    if m:
+        return m.group(1).upper()
 
     return None
 
 
 # =========================================================
-# SYSTEM INSTRUCTIONS
+# TEAM FORM FROM sportapi
 # =========================================================
 
-SYSTEM = f"""You are BetOracle, a sharp, friendly sports-betting assistant for Nigerian bettors.
-
-Today is {date.today():%A %Y-%m-%d}.
-
-Talk like a normal person, short and direct.
-
-Follow the user's instructions exactly.
-
-IMPORTANT BOOKING RULES:
-
-Generating predictions does not mean the user wants a ticket created.
-
-Adding selections to a ticket requires the user's request.
-
-Creating a SportyBet booking code requires an explicit booking request.
-
-Booking creates a booking code only. You never place real-money bets.
-
-You must never automatically book predictions.
-
-For ordinary prediction requests, the Python prediction engine handles the request.
-
-RULES:
-
-Never invent odds, fixtures or statistics. Use tools.
-
-For every football or basketball selection, call get_stats first.
-
-Its reason MUST give the real numbers:
-- Each team's league position and record.
-- Each team's last 5 results.
-- The home team's last 5 at home.
-- The away team's last 5 away.
-- Head-to-head.
-- Explain how the evidence supports the exact market.
-
-If a sport or market has no statistics source, say plainly if the pick rests on odds only.
-
-Any market on SportyBet is allowed:
-corners, fouls, shots, tackles, cards, player props, basketball, darts, tennis and more.
-
-For a target like "give me 25 odds mixing football, basketball and darts":
-gather real odds with get_markets for each sport, pick the best-supported selections, and stop when combined odds reach the target.
-
-If odds are unavailable for a sport, say so. Never fill the gap with guessed odds.
-
-You can edit tickets on request:
-- Remove legs by number or odds range.
-- Replace legs.
-- Convert every leg to another market.
-- Split into N slips with split_ticket.
-- Book each with book_ticket when explicitly requested.
-
-When the user gives a target total odds, keep the total within a few percent of it after every edit and state the final total.
-
-"Value picks" means avoid legs under 1.15 odds.
-
-Start replies with the booking code when there is one.
-
-When asked why a leg was chosen, answer from the numbers you gathered.
-
-For corner picks call get_corner_history for both teams.
-
-For shots, fouls, tackles or cards call get_team_stat_history.
-Cite the averages and how many of the last matches cleared the line.
-
-Use get_markets with the search keyword for the market the user wants.
-
-Copy each chosen selection's ref exactly.
-
-A booking code is a SportyBet slip that stakes nothing.
-
-If the user pastes a booking code:
-call read_code, leave platform empty unless they said which bookmaker. It is auto-detected.
-
-Users never pick a bookmaker from a menu.
-Understand the destination from ordinary text such as:
-"convert to Bet9ja", "change this to Sporty" or "I want this on BetNaija".
-
-Then call convert_code with that target.
-
-To move a code to another bookmaker call convert_code.
-
-Never remove, replace or edit a selection silently.
-
-If any leg is suspended, not listed or missing from the created code, say exactly which and ask before continuing.
-
-Only say a code was created if a tool returned it.
-
-If a tool fails, tell the user plainly what is missing.
-
-ALWAYS finish with a written reply to the user. Never end your turn with only tool calls.
-"""
-
-
-# =========================================================
-# TOOL DEFINITIONS
-# =========================================================
-
-TOOLS = [
-
-    {
-        "name": "get_fixtures",
-        "description": "List fixtures for a sport between two dates (YYYY-MM-DD).",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "sport": {"type": "string"},
-                "date_from": {"type": "string"},
-                "date_to": {"type": "string"},
-                "league": {"type": "string"}
-            },
-            "required": ["sport", "date_from", "date_to"]
-        }
-    },
-
-    {
-        "name": "get_markets",
-        "description": "All SportyBet markets and odds for one match.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "sport": {"type": "string"},
-                "home": {"type": "string"},
-                "away": {"type": "string"},
-                "search": {
-                    "type": "string",
-                    "description": "Comma-separated market keywords."
-                }
-            },
-            "required": ["sport", "home", "away"]
-        }
-    },
-
-    {
-        "name": "read_code",
-        "description": "Load an existing booking code.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "code": {"type": "string"},
-                "platform": {"type": "string"}
-            },
-            "required": ["code"]
-        }
-    },
-
-    {
-        "name": "get_stats",
-        "description": "Evidence for football or basketball: table position, form and head-to-head.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "sport": {"type": "string"},
-                "home_id": {"type": "integer"},
-                "away_id": {"type": "integer"},
-                "league_id": {"type": ["integer", "string"]}
-            },
-            "required": ["sport", "home_id", "away_id", "league_id"]
-        }
-    },
-
-    {
-        "name": "add_to_ticket",
-        "description": "Add picks to the user's ticket. Each needs a reason.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "selections": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "home": {"type": "string"},
-                            "away": {"type": "string"},
-                            "kickoff": {"type": "string"},
-                            "sport": {"type": "string"},
-                            "ref": {"type": "string"},
-                            "market": {"type": "string"},
-                            "pick": {"type": "string"},
-                            "odds": {"type": "number"},
-                            "reason": {"type": "string"}
-                        },
-                        "required": [
-                            "home",
-                            "away",
-                            "market",
-                            "pick",
-                            "odds",
-                            "reason",
-                            "ref"
-                        ]
-                    }
-                }
-            },
-            "required": ["selections"]
-        }
-    },
-
-    {
-        "name": "remove_legs",
-        "description": "Remove ticket legs by number or odds range.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "indices": {
-                    "type": "array",
-                    "items": {"type": "integer"}
-                },
-                "odds_between": {
-                    "type": "array",
-                    "items": {"type": "number"}
-                }
-            }
-        }
-    },
-
-    {
-        "name": "split_ticket",
-        "description": "Split the ticket into N slips.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "parts": {"type": "integer"}
-            },
-            "required": ["parts"]
-        }
-    },
-
-    {
-        "name": "get_team_stat_history",
-        "description": "Football team history for shots, fouls, tackles and cards.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "team_id": {"type": "integer"},
-                "league_id": {"type": "integer"},
-                "n": {"type": "integer"}
-            },
-            "required": ["team_id", "league_id"]
-        }
-    },
-
-    {
-        "name": "get_corner_history",
-        "description": "Team corner history and averages.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "team": {"type": "string"},
-                "n": {"type": "integer"}
-            },
-            "required": ["team"]
-        }
-    },
-
-    {
-        "name": "convert_code",
-        "description": "Convert a booking code from one Nigerian bookmaker to another.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "source": {"type": "string"},
-                "code": {"type": "string"},
-                "target": {"type": "string"},
-                "allow_partial": {"type": "boolean"}
-            },
-            "required": ["code", "target"]
-        }
-    },
-
-    {
-        "name": "clear_ticket",
-        "description": "Empty the ticket.",
-        "input_schema": {
-            "type": "object",
-            "properties": {}
-        }
-    },
-
-    {
-        "name": "book_ticket",
-        "description": "Book the ticket on SportyBet and return booking codes. Use only after an explicit booking request.",
-        "input_schema": {
-            "type": "object",
-            "properties": {}
-        }
-    },
-
-    {
-        "name": "convert_ticket",
-        "description": "Convert the ticket for another platform: " + ", ".join(PLATFORMS),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "platform": {
-                    "type": "string",
-                    "enum": PLATFORMS
-                }
-            },
-            "required": ["platform"]
-        }
-    }
-
-]
-
-
-# =========================================================
-# GROQ TOOL FORMAT
-# =========================================================
-
-GROQ_TOOLS = [
-
-    {
-        "type": "function",
-        "function": {
-            "name": tool["name"],
-            "description": tool["description"],
-            "parameters": tool["input_schema"]
-        }
-    }
-
-    for tool in TOOLS
-
-]
-
-
-# =========================================================
-# TICKET HELPERS
-# =========================================================
-
-def names(legs):
-
-    return [
-        f'{x["home"]} v {x["away"]}: '
-        f'{x["market"]} {x["pick"]} @ {x["odds"]}'
-        for x in legs
+def lookup_slug(f, team_id):
+    try:
+        rows = sportapi.get(f"/standings/{f['league_id']}", sportapi.H6).get("data", [])
+        for r in rows:
+            if r["team"]["id"] == team_id:
+                return r["team"]["slug"]
+    except Exception:
+        pass
+    return None
+
+
+def team_form(f, side):
+    tid = f[f"{side}_id"]
+    name = f[f"{side}_team"]
+
+    slugs = []
+    for s in (f.get(f"{side}_slug"), lookup_slug(f, tid), slugify(name)):
+        if s and s not in slugs:
+            slugs.append(s)
+
+    res, slug = [], None
+
+    for s in slugs:
+        try:
+            res = sportapi.get(f"/teams/slug/{s}", sportapi.H6).get("results", [])
+        except Exception:
+            res = []
+        if res:
+            slug = s
+            break
+
+    if not res:
+        return None
+
+    fin = [
+        m for m in res
+        if m.get("status") in sportapi.FIN
+        and m.get("home_score") is not None
+        and m.get("away_score") is not None
     ]
+    fin.sort(key=lambda m: m.get("date", ""), reverse=True)
+
+    rows = []
+
+    for m in fin[:FORM_N]:
+        home = m.get("home_slug") == slug or m.get("home_team") == name
+        away = m.get("away_slug") == slug or m.get("away_team") == name
+
+        if not (home or away):
+            continue
+
+        gf, ga = (
+            (m["home_score"], m["away_score"]) if home
+            else (m["away_score"], m["home_score"])
+        )
+        rows.append((gf, ga))
+
+    n = len(rows)
+
+    if n < MIN_FORM:
+        return None
+
+    sc = sum(1 for gf, ga in rows if gf > 0)
+    co = sum(1 for gf, ga in rows if ga > 0)
+    bt = sum(1 for gf, ga in rows if gf > 0 and ga > 0)
+    o15 = sum(1 for gf, ga in rows if gf + ga >= 2)
+    o25 = sum(1 for gf, ga in rows if gf + ga >= 3)
+
+    return {
+        "n": n, "sc": sc, "co": co, "bt": bt, "o15c": o15, "o25c": o25,
+        "scored": sc / n, "conceded": co / n, "btts": bt / n,
+        "o15": o15 / n, "o25": o25 / n,
+    }
 
 
-def prod(legs):
+def load_forms(fixtures):
+    tasks = {}
 
-    return round(
-        math.prod(x["odds"] for x in legs),
-        2
+    for f in fixtures:
+        for side in ("home", "away"):
+            tasks.setdefault(f[f"{side}_id"], (f, side))
+
+    def work(item):
+        tid, (f, side) = item
+        try:
+            return tid, team_form(f, side)
+        except Exception as e:
+            print("FORM ERROR:", f.get(f"{side}_team"), type(e).__name__, e)
+            return tid, None
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        return dict(ex.map(work, tasks.items()))
+
+
+# =========================================================
+# MARKETS: SCORING THE MATCHES
+# =========================================================
+
+MARKETS = {
+    "gg": {
+        "label": "GG (both teams to score)",
+        "market": "GG/NG", "pick": "Yes",
+        "search": "GG/NG,Both Teams To Score,BTTS",
+    },
+    "over25": {
+        "label": "Over 2.5 goals",
+        "market": "Over/Under 2.5", "pick": "Over 2.5",
+        "search": "Over/Under,Total",
+    },
+    "over15": {
+        "label": "Over 1.5 goals",
+        "market": "Over/Under 1.5", "pick": "Over 1.5",
+        "search": "Over/Under,Total",
+    },
+}
+
+
+def score_market(key, h, a):
+    if key == "gg":
+        est = ((h["scored"] + a["conceded"]) / 2) * ((a["scored"] + h["conceded"]) / 2)
+        score = 0.5 * est + 0.5 * ((h["btts"] + a["btts"]) / 2)
+        thr = 0.55
+        ok = h["btts"] >= 0.5 and a["btts"] >= 0.5
+    elif key == "over25":
+        score = (h["o25"] + a["o25"]) / 2
+        thr = 0.60
+        ok = min(h["o25"], a["o25"]) >= 0.5
+    else:
+        score = (h["o15"] + a["o15"]) / 2
+        thr = 0.80
+        ok = min(h["o15"], a["o15"]) >= 0.7
+
+    return {"score": score, "margin": score - thr, "strong": ok and score >= thr}
+
+
+def reason_text(key, f, h, a):
+    H, A = f["home_team"], f["away_team"]
+    nh, na = h["n"], a["n"]
+
+    if key == "gg":
+        return (
+            f"{H} scored in {h['sc']}/{nh} and conceded in {h['co']}/{nh} with BTTS in "
+            f"{h['bt']}/{nh}; {A} scored in {a['sc']}/{na} and conceded in {a['co']}/{na} "
+            f"with BTTS in {a['bt']}/{na}. Both sides score and concede regularly, "
+            f"which supports GG."
+        )
+
+    if key == "over25":
+        return (
+            f"{H} had 3+ goals in {h['o25c']}/{nh} of their last matches and {A} in "
+            f"{a['o25c']}/{na}. Both teams are involved in high-scoring games, "
+            f"which supports Over 2.5."
+        )
+
+    return (
+        f"{H} had 2+ goals in {h['o15c']}/{nh} of their last matches and {A} in "
+        f"{a['o15c']}/{na}. Both teams regularly play games with at least two goals, "
+        f"which supports Over 1.5."
     )
 
 
-# =========================================================
-# CHAT HELPERS
-# =========================================================
+def evaluate(f, h, a, market):
+    keys = ["gg", "over25", "over15"] if market == "auto" else [market]
 
-def compact(result, limit=TOOL_RESULT_LIMIT):
+    best = None
 
-    text = json.dumps(
-        result,
-        default=str,
-        separators=(",", ":")
-    )
+    for k in keys:
+        r = score_market(k, h, a)
+        if best is None or r["margin"] > best["margin"]:
+            best = {**r, "key": k}
 
-    if len(text) > limit:
-        text = text[:limit] + '..."[truncated]"'
+    if best and best["strong"]:
+        return {"f": f, "h": h, "a": a, **best}
 
-    return text
-
-
-def trim_history(msgs):
-
-    if len(msgs) > MAX_HISTORY:
-
-        del msgs[:-MAX_HISTORY]
-
-    while msgs and msgs[0]["role"] != "user":
-
-        del msgs[0]
+    return None
 
 
 # =========================================================
-# TOOL EXECUTION
+# SPORTYBET: FINDING THE RIGHT SELECTION
 # =========================================================
 
-def run_tool(name, a, s):
+LABEL_KEYS = (
+    "market", "market_name", "marketName", "name", "title", "desc",
+    "description", "pick", "outcome", "label", "selection", "specifier"
+)
 
-    t = s["ticket"]
+BAD = re.compile(
+    r"\b(1st half|2nd half|first half|second half|half|corners?|bookings?|cards?|"
+    r"players?|exact|handicap|asian)\b|&|\band\b"
+)
+
+
+def walk(obj, ctx=""):
+    """Yield (ancestor_text, own_text, selection) for every dict holding 'ref' and 'odds'."""
+
+    if isinstance(obj, dict):
+        own = " ".join(
+            str(obj[k]) for k in LABEL_KEYS
+            if isinstance(obj.get(k), (str, int, float)) and not isinstance(obj.get(k), bool)
+        )
+        full = (ctx + " " + own).strip()
+
+        if "ref" in obj and "odds" in obj:
+            yield ctx, own, obj
+
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                yield from walk(v, full)
+
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from walk(v, ctx)
+
+
+def find_selection(markets, key):
+    for ctx, own, sel in walk(markets):
+
+        combined = (ctx + " " + own).lower()
+        pick = (own or combined).lower()
+
+        if BAD.search(combined):
+            continue
+
+        if key == "gg":
+            if not re.search(r"both teams to score|gg\s*/\s*ng|\bbtts\b|\bgg\b", combined):
+                continue
+            p = re.sub(r"gg\s*/\s*ng", " ", pick)
+            if re.search(r"\b(yes|gg)\b", p) and not re.search(r"\b(no|ng)\b", p):
+                return sel
+
+        else:
+            line = "2.5" if key == "over25" else "1.5"
+            if line not in combined:
+                continue
+            if not re.search(r"over\s*/\s*under|goals|total", combined):
+                continue
+            p = re.sub(r"over\s*/\s*under", " ", pick)
+            if re.search(r"\bover\b", p) and not re.search(r"\bunder\b", p):
+                return sel
+
+    return None
+
+
+def lookup_leg(c):
+    """Find the SportyBet selection for one candidate. Returns (candidate, leg_or_None, why)."""
+
+    f = c["f"]
+    spec = MARKETS[c["key"]]
 
     try:
-
-        if name == "get_fixtures":
-
-            if a["sport"].lower() in (
-                "football",
-                "soccer",
-                "basketball"
-            ):
-
-                sport = (
-                    "basketball"
-                    if a["sport"].lower() == "basketball"
-                    else "football"
-                )
-
-                return sportapi.fixtures(
-                    sport,
-                    a["date_from"],
-                    a["date_to"],
-                    a.get("league")
-                )
-
-            return sportybet.list_events(
-                a["sport"],
-                a["date_from"],
-                a["date_to"],
-                a.get("league")
-            )
-
-        if name == "get_markets":
-
-            return sportybet.get_markets(
-                a["sport"],
-                a["home"],
-                a["away"],
-                a.get("search")
-            )
-
-        if name == "read_code":
-
-            out = router.read_for_chat(
-                a["code"],
-                a.get("platform")
-            )
-
-            if "legs_list" in out:
-
-                t[:] = out.pop("legs_list")
-                s["slips"] = []
-
-            return out
-
-        if name == "get_stats":
-
-            return sportapi.stats(
-                a["sport"],
-                a["home_id"],
-                a["away_id"],
-                a["league_id"]
-            )
-
-        if name == "add_to_ticket":
-
-            for x in a["selections"]:
-
-                if not x.get("ref"):
-
-                    return {
-                        "error": (
-                            f"Rejected {x['home']} v {x['away']}: "
-                            "missing ref. Call get_markets and copy "
-                            "the exact selection ref."
-                        )
-                    }
-
-                reason = x.get("reason", "")
-
-                if (
-                    x.get("sport", "football")
-                    in ("football", "basketball")
-                    and (
-                        len(reason) < 150
-                        or sum(c.isdigit() for c in reason) < 8
-                    )
-                ):
-
-                    return {
-                        "error": (
-                            f"Rejected {x['home']} v {x['away']}: "
-                            "reason must cite real statistics. "
-                            "Call get_stats and rewrite."
-                        )
-                    }
-
-            t.extend(a["selections"])
-
-            return {
-                "ticket_size": len(t)
-            }
-
-        if name == "clear_ticket":
-
-            t.clear()
-            s["slips"] = []
-
-            return "cleared"
-
-        if name == "get_team_stat_history":
-
-            return sportapi.team_history(
-                a["team_id"],
-                a["league_id"],
-                a.get("n", 8)
-            )
-
-        if name == "get_corner_history":
-
-            return corners.team_corners(
-                a["team"],
-                a.get("n", 8)
-            )
-
-        if name == "convert_code":
-
-            out = router.convert_for_chat(
-                a["code"],
-                a.get("source"),
-                a["target"],
-                a.get("allow_partial", False)
-            )
-
-            if "ticket" in out:
-
-                t[:] = out.pop("ticket")
-                s["slips"] = []
-
-            if "new_code" in out:
-
-                s["codes"].append(
-                    out.pop("new_code")
-                )
-
-            return out
-
-        if name == "remove_legs":
-
-            idx = {
-                i - 1
-                for i in a.get("indices", [])
-            }
-
-            rng = a.get("odds_between")
-
-            gone = [
-                x for i, x in enumerate(t)
-                if i in idx
-                or (
-                    rng
-                    and len(rng) >= 2
-                    and rng[0] <= x["odds"] <= rng[1]
-                )
-            ]
-
-            t[:] = [
-                x for i, x in enumerate(t)
-                if i not in idx
-                and not (
-                    rng
-                    and len(rng) >= 2
-                    and rng[0] <= x["odds"] <= rng[1]
-                )
-            ]
-
-            s["slips"] = []
-
-            return {
-                "removed": len(gone),
-                "ticket_size": len(t),
-                "total_odds": prod(t) if t else 0
-            }
-
-        if name == "split_ticket":
-
-            if not t:
-
-                return {
-                    "error": "The ticket is empty."
-                }
-
-            n = max(
-                2,
-                min(int(a["parts"]), len(t))
-            )
-
-            cap = math.ceil(len(t) / n)
-
-            groups = [[] for _ in range(n)]
-            logs = [0.0] * n
-
-            for x in sorted(
-                t,
-                key=lambda x: -x["odds"]
-            ):
-
-                i = min(
-                    (
-                        j for j in range(n)
-                        if len(groups[j]) < cap
-                    ),
-                    key=lambda j: logs[j]
-                )
-
-                groups[i].append(x)
-                logs[i] += math.log(x["odds"])
-
-            s["slips"] = groups
-
-            return [
-                {
-                    "slip": i + 1,
-                    "games": len(g),
-                    "odds": prod(g) if g else 0
-                }
-                for i, g in enumerate(groups)
-            ]
-
-        if name == "book_ticket":
-
-            out = []
-
-            for g in (s["slips"] or [t]):
-
-                if not g:
-                    continue
-
-                r = sportybet.book(g)
-
-                item = {
-                    "code": r["code"],
-                    "games": len(g),
-                    "odds": round(
-                        r.get("total_odds") or prod(g),
-                        2
-                    )
-                }
-
-                out.append(item)
-                s["codes"].append(item)
-
-            if not out:
-
-                return {
-                    "error": "The ticket is empty. Add selections first."
-                }
-
-            return out
-
-        if name == "convert_ticket" and a["platform"] == "msport":
-
-            if not t:
-
-                return {
-                    "error": "The ticket is empty."
-                }
-
-            r = msport.create_msport_code(t)
-
-            item = {
-                "code": r["code"],
-                "games": r["sent"],
-                "odds": prod(t)
-            }
-
-            s["codes"].append(item)
-
-            return r
-
-        if name == "convert_ticket":
-
-            lines = [
-                (
-                    f'{x["home"]} v {x["away"]} | '
-                    f'{x["market"]}: {x["pick"]} @ {x["odds"]}'
-                )
-                for x in t
-            ]
-
-            return {
-                "platform": a["platform"],
-                "status": "manual_slip",
-                "slip": lines,
-                "note": (
-                    "No live adapter for this platform yet. "
-                    "Market names may differ; match each line by hand."
-                )
-            }
-
-        return {
-            "error": f"Unknown tool: {name}"
-        }
-
+        data = sportybet.get_markets(
+            "football", f["home_team"], f["away_team"], spec["search"]
+        )
     except Exception as e:
+        return c, None, f"not available on SportyBet ({type(e).__name__})"
 
-        return {
-            "error": f"{type(e).__name__}: {e}"
-        }
+    sel = find_selection(data, c["key"])
+
+    if not sel:
+        print("NO SELECTION FOUND:", c["key"], f["home_team"], "v", f["away_team"])
+        return c, None, "market not found on SportyBet"
+
+    try:
+        odds = float(sel["odds"])
+    except Exception:
+        return c, None, "odds missing"
+
+    leg = {
+        "home": f["home_team"],
+        "away": f["away_team"],
+        "kickoff": f.get("kickoff_utc", ""),
+        "sport": "football",
+        "ref": sel["ref"],
+        "market": spec["market"],
+        "pick": spec["pick"],
+        "odds": odds,
+        "reason": reason_text(c["key"], f, c["h"], c["a"]),
+        "league": f.get("league_name", ""),
+    }
+
+    return c, leg, ""
 
 
 # =========================================================
-# GROQ API REQUEST
-# KEPT FOR FUTURE RE-ENABLEMENT
+# BUILDING A TICKET
 # =========================================================
 
-def groq_request(messages, use_tools=True):
+def book_legs(legs, s):
+    r = sportybet.book(legs)
+    item = {
+        "code": r["code"],
+        "games": len(legs),
+        "odds": round(r.get("total_odds") or prod(legs), 2),
+    }
+    s["codes"].append(item)
+    return item
 
-    if not GROQ_ENABLED:
 
-        raise RuntimeError(
-            "Groq is disabled for testing."
+def format_legs(legs):
+    lines = []
+    for i, x in enumerate(legs, 1):
+        lines.append(
+            f"{i}. {x['home']} vs {x['away']}\n"
+            f"   {x.get('league', '')} · {x.get('kickoff_label', '')}\n"
+            f"   {x['market']}: {x['pick']} @ {x['odds']:.2f}\n"
+            f"   {x['reason']}"
+        )
+    return "\n\n".join(lines)
+
+
+def build_ticket(t, s):
+    d_from, d_to, when = parse_dates(t)
+    market = parse_market(t) or "auto"
+    count, target = parse_numbers(t)
+
+    if not count and not target:
+        count = 5
+
+    fixtures = []
+    d = d_from
+    while d <= d_to:
+        data = sportapi.get(f"/fixtures/date/{d.isoformat()}", sportapi.H1).get("data", [])
+        fixtures += [f for f in data if f.get("status") == "Scheduled"]
+        d += timedelta(days=1)
+
+    seen, unique = set(), []
+    for f in fixtures:
+        k = (f.get("home_id"), f.get("away_id"), f.get("kickoff_utc"))
+        if k not in seen:
+            seen.add(k)
+            unique.append(f)
+    fixtures = unique
+
+    fixtures, league_label = pick_leagues(t, fixtures)
+
+    if not fixtures:
+        return (
+            f"I found no scheduled {league_label} matches for {when}. "
+            f"Try another day or league, for example: "
+            f"\"Give me 5 GG matches from tomorrow's Premier League\"."
         )
 
-    if not GROQ_API_KEY:
+    fixtures.sort(key=lambda f: f.get("kickoff_utc", ""))
+    total_found = len(fixtures)
+    fixtures = fixtures[:MAX_ANALYSE]
 
-        raise RuntimeError(
-            "GROQ_API_KEY is missing from Render environment variables."
+    forms = load_forms(fixtures)
+
+    cands, no_data = [], 0
+
+    for f in fixtures:
+        h, a = forms.get(f["home_id"]), forms.get(f["away_id"])
+        if not h or not a:
+            no_data += 1
+            continue
+        c = evaluate(f, h, a, market)
+        if c:
+            cands.append(c)
+
+    cands.sort(key=lambda c: -c["margin"])
+
+    if not cands:
+        return (
+            f"I checked {len(fixtures)} {league_label} matches for {when}, but none passed "
+            f"the stats check ({no_data} had no usable form data). "
+            f"I would rather give you nothing than weak picks."
         )
 
-    payload = {
-        "model": MODEL,
-        "messages": messages,
-        "max_completion_tokens": MAX_OUT,
-        "temperature": 0.2
-    }
+    # look up real SportyBet odds for the best candidates (in parallel)
+    top = cands[: (count + 4) if count else 15]
 
-    if MODEL.startswith("openai/gpt-oss"):
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        looked = list(ex.map(lookup_leg, top))
 
-        payload["reasoning_effort"] = "low"
+    legs, skipped = [], []
 
-    if use_tools:
+    for c, leg, why in looked:
+        f = c["f"]
+        if not leg:
+            skipped.append(f"{f['home_team']} vs {f['away_team']}: {why}")
+            continue
 
-        payload["tools"] = GROQ_TOOLS
-        payload["tool_choice"] = "auto"
-        payload["parallel_tool_calls"] = False
+        leg["kickoff_label"] = kick_time(f)
 
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    last_error = ""
-
-    for attempt in range(GROQ_RETRIES + 1):
-
-        try:
-
-            response = httpx.post(
-                GROQ_URL,
-                headers=headers,
-                json=payload,
-                timeout=httpx.Timeout(
-                    GROQ_TIMEOUT,
-                    connect=5
-                )
-            )
-
-        except httpx.TimeoutException:
-
-            last_error = (
-                f"Groq timed out after {GROQ_TIMEOUT} seconds."
-            )
-
-            if attempt < GROQ_RETRIES:
-
-                time.sleep(1)
-                continue
-
+        if count and len(legs) >= count:
+            break
+        if target and legs and prod(legs) >= target:
             break
 
-        except httpx.RequestError as e:
+        legs.append(leg)
 
-            last_error = f"Groq connection error: {e}"
+    if not legs:
+        return (
+            "I found strong matches but could not find their markets on SportyBet.\n"
+            + "\n".join(skipped[:5])
+            + "\n\nOpen /api/debug-markets?home=TeamA&away=TeamB on your site and send me "
+              "that output so I can match the market names."
+        )
 
-            if attempt < GROQ_RETRIES:
+    s["ticket"][:] = legs
+    s["slips"] = []
 
-                time.sleep(1)
-                continue
+    # book it
+    try:
+        item = book_legs(legs, s)
+        code_line = f"🎟 BOOKING CODE: {item['code']}\n{item['games']} games · total odds {item['odds']}"
+    except Exception as e:
+        code_line = (
+            f"Ticket built, but SportyBet booking failed: {type(e).__name__}: {e}\n"
+            f"Total odds {prod(legs)}"
+        )
 
-            break
+    notes = []
 
-        if response.status_code == 429:
+    if count and len(legs) < count:
+        notes.append(
+            f"Only {len(legs)} matches passed the stats check, not the {count} you asked for. "
+            f"I left the weak ones out on purpose."
+        )
 
-            last_error = (
-                "Groq rate limit reached. "
-                + response.text[:300]
-            )
+    if target and prod(legs) < target * 0.9:
+        notes.append(
+            f"Total odds are {prod(legs)}, below your {target} target, because not enough "
+            f"matches passed the stats check."
+        )
 
-            if attempt < GROQ_RETRIES:
-
-                time.sleep(2)
-                continue
-
-            break
-
-        if (
-            response.status_code == 400
-            and "tool_use_failed" in response.text
-        ):
-
-            last_error = (
-                f"Groq tool_use_failed: {response.text[:300]}"
-            )
-
-            if attempt < GROQ_RETRIES:
-
-                time.sleep(1)
-                continue
-
-            break
-
-        if response.status_code >= 400:
-
-            raise RuntimeError(
-                f"Groq HTTP {response.status_code}: "
-                f"{response.text[:800]}"
-            )
-
-        try:
-
-            data = response.json()
-
-        except ValueError:
-
-            raise RuntimeError(
-                "Groq returned invalid JSON."
-            )
-
-        if not data.get("choices"):
-
-            last_error = "Groq returned an empty response."
-
-            if attempt < GROQ_RETRIES:
-                continue
-
-            break
-
-        return data["choices"][0]["message"]
-
-    raise RuntimeError(
-        last_error or "Groq request failed."
+    notes.append(
+        f"Checked {len(fixtures)} of {total_found} {league_label} matches for {when}"
+        + (f" ({no_data} had no form data)." if no_data else ".")
     )
+
+    reply = code_line + "\n\n" + "\n".join(notes) + "\n\n" + format_legs(legs)
+
+    if skipped:
+        reply += "\n\nSkipped (strong stats, but no usable market on SportyBet):\n" + "\n".join(skipped[:5])
+
+    reply += "\n\nSay \"convert to Bet9ja\" (or MSport, BetNaija...) to move this code."
+
+    return reply
+
+
+# =========================================================
+# CODES: READ, CONVERT, BOOK, EDIT
+# =========================================================
+
+def describe(out):
+    lines = []
+    for k, v in out.items():
+        if isinstance(v, (str, int, float)) and not isinstance(v, bool):
+            lines.append(f"{k}: {v}")
+        elif isinstance(v, list) and v and all(isinstance(i, str) for i in v):
+            lines.append(f"{k}:\n  " + "\n  ".join(v[:15]))
+    return "\n".join(lines)
+
+
+def do_read(code, s):
+    try:
+        out = router.read_for_chat(code, None)
+    except Exception as e:
+        return f"I could not read code {code}: {type(e).__name__}: {e}"
+
+    legs = out.pop("legs_list", None)
+
+    if legs:
+        s["ticket"][:] = legs
+        s["slips"] = []
+
+    reply = f"Loaded code {code}."
+
+    if legs:
+        reply += f" {len(legs)} games, total odds {prod(legs)}.\n\n"
+        reply += "\n".join(
+            f"{i}. {x['home']} vs {x['away']}: {x['market']} {x['pick']} @ {x['odds']}"
+            for i, x in enumerate(legs, 1)
+        )
+
+    extra = describe(out)
+
+    if extra:
+        reply += "\n\n" + extra
+
+    reply += "\n\nTell me where to send it, e.g. \"convert to Bet9ja\"."
+
+    return reply
+
+
+def do_convert(code, target, s):
+    try:
+        out = router.convert_for_chat(code, None, target, False)
+    except Exception as e:
+        return f"Conversion failed: {type(e).__name__}: {e}"
+
+    if "ticket" in out:
+        s["ticket"][:] = out.pop("ticket")
+        s["slips"] = []
+
+    new = out.pop("new_code", None)
+
+    label = bookmakers.BOOKMAKERS.get(target, {}).get("label", target)
+
+    if new:
+        s["codes"].append(new if isinstance(new, dict) else {"code": new, "games": len(s["ticket"]), "odds": prod(s["ticket"])})
+        shown = new.get("code") if isinstance(new, dict) else new
+        reply = f"🎟 {label} CODE: {shown}"
+    else:
+        reply = f"I could not create a {label} code."
+
+    extra = describe(out)
+
+    if extra:
+        reply += "\n\n" + extra
+
+    return reply
+
+
+def do_book(s):
+    legs = s["ticket"]
+
+    if not legs:
+        return "Your ticket is empty. Ask me for matches first, e.g. \"Give me 5 GG matches today\"."
+
+    try:
+        item = book_legs(legs, s)
+    except Exception as e:
+        return f"SportyBet booking failed: {type(e).__name__}: {e}"
+
+    return f"🎟 BOOKING CODE: {item['code']}\n{item['games']} games · total odds {item['odds']}"
+
+
+def do_remove(t, s):
+    legs = s["ticket"]
+
+    if not legs:
+        return "Your ticket is empty."
+
+    gone = 0
+
+    m = re.search(r"(?:below|under|less than|lower than)\s*(\d+(?:\.\d+)?)", t)
+
+    if m:
+        lim = float(m.group(1))
+        keep = [x for x in legs if x["odds"] >= lim]
+        gone = len(legs) - len(keep)
+        legs[:] = keep
+    else:
+        idx = {int(n) - 1 for n in re.findall(r"\b\d{1,2}\b", t)}
+        keep = [x for i, x in enumerate(legs) if i not in idx]
+        gone = len(legs) - len(keep)
+        legs[:] = keep
+
+    if not gone:
+        return "I did not remove anything. Say e.g. \"remove leg 3\" or \"remove odds below 1.2\"."
+
+    if not legs:
+        return "Removed. Your ticket is now empty."
+
+    return (
+        f"Removed {gone} leg(s). {len(legs)} games left, total odds {prod(legs)}.\n\n"
+        + format_legs([{**x, "league": x.get("league", ""), "kickoff_label": ""} for x in legs])
+        + "\n\nSay \"book this ticket\" for a new code."
+    )
+
+
+def help_text(lead=""):
+    names = ", ".join(v.get("label", k) for k, v in bookmakers.BOOKMAKERS.items())
+    return (
+        (lead + "\n\n" if lead else "")
+        + "I build tickets from real form stats and give you the booking code. Try:\n\n"
+        "• Give me 10 matches that can play GG from today's European competitions\n"
+        "• Give me 25 odds from tomorrow's Premier League\n"
+        "• Over 2.5 picks for the weekend\n"
+        "• Paste a booking code to read it\n"
+        "• convert MX96ZD to Bet9ja\n"
+        "• convert this to MSport (uses your last code)\n"
+        "• remove leg 3 / remove odds below 1.2 / book this ticket\n\n"
+        f"Bookmakers: {names}"
+    )
+
+
+# =========================================================
+# ROUTING: WHAT DOES THE USER WANT?
+# =========================================================
+
+def handle(msg, s):
+    text = (msg or "").strip()
+    t = text.lower()
+
+    if not t or re.match(r"^(hi+|hello|hey|yo|help|start|menu)\b", t) or "what can you do" in t:
+        return help_text("Hi! I'm BetOracle.")
+
+    code = detect_code(text)
+    bk = detect_bookmaker(t)
+    conv = re.search(r"\b(convert|change|move|switch|transfer|send|put)\b", t)
+    readw = re.search(r"\b(read|check|load|open|show|see|view|code|booking)\b", t)
+
+    # 1. a booking code was pasted
+    if code and (conv or bk or readw or norm(text) == norm(code)):
+        return do_convert(code, bk, s) if bk else do_read(code, s)
+
+    # 2. "convert this to Bet9ja" with no code: use the last code
+    if bk and conv:
+        if s["codes"]:
+            return do_convert(s["codes"][-1]["code"], bk, s)
+        return "Paste the booking code you want to convert, or ask me for a ticket first."
+
+    # 3. clear
+    if re.search(r"\b(clear|reset|empty|start over)\b", t):
+        s["ticket"].clear()
+        s["slips"] = []
+        return "Ticket cleared."
+
+    # 4. remove legs
+    if re.search(r"\b(remove|delete|drop)\b", t) and s["ticket"]:
+        return do_remove(t, s)
+
+    market = parse_market(t)
+    count, target = parse_numbers(t)
+
+    # 5. book the current ticket
+    if (
+        re.search(r"\bbook\b", t)
+        and re.search(r"\b(this|it|that|ticket|slip|now)\b", t)
+        and not market
+        and not re.search(r"\d", t)
+    ):
+        return do_book(s)
+
+    # 6. build a new ticket
+    if market or count or target or mentions_league(t) or re.search(
+        r"\b(match|matches|game|games|pick|picks|odds?|ticket|slip|tips?|predict\w*|banker|safe|book|today|tomorrow|weekend|tonight)\b", t
+    ):
+        return build_ticket(t, s)
+
+    return help_text("I did not catch that.")
 
 
 # =========================================================
@@ -983,7 +878,6 @@ def groq_request(messages, use_tools=True):
 # =========================================================
 
 class Chat(BaseModel):
-
     session: str
     message: str
 
@@ -991,465 +885,67 @@ class Chat(BaseModel):
 app = FastAPI()
 
 
-# =========================================================
-# GROQ DIRECT TEST
-# =========================================================
-
-@app.get("/api/test-groq")
-def test_groq():
-
-    if not GROQ_ENABLED:
-
-        return {
-            "success": False,
-            "enabled": False,
-            "message": "Groq is temporarily disabled."
-        }
-
-    started = time.time()
-
-    try:
-
-        result = groq_request(
-            [
-                {
-                    "role": "user",
-                    "content": "Reply with: Groq is working."
-                }
-            ],
-            use_tools=False
-        )
-
-        return {
-            "success": True,
-            "model": MODEL,
-            "reply": result.get("content"),
-            "elapsed_seconds": round(
-                time.time() - started,
-                2
-            )
-        }
-
-    except Exception as e:
-
-        return {
-            "success": False,
-            "model": MODEL,
-            "error": str(e),
-            "elapsed_seconds": round(
-                time.time() - started,
-                2
-            )
-        }
-
-
-# =========================================================
-# CHAT ENDPOINT
-# GROQ DISABLED / PYTHON PREDICTIONS ACTIVE
-# =========================================================
-
 @app.post("/api/chat")
 def chat(c: Chat):
 
-    started = time.time()
-
-    session_id = c.session.strip()
-    message = c.message.strip()
-
-    if not session_id:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Session ID is required."
-        )
-
-    if not message:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Message cannot be empty."
-        )
-
-    lock = get_session_lock(session_id)
-
-    if not lock.acquire(timeout=60):
-
-        raise HTTPException(
-            status_code=409,
-            detail="A request is already processing. Please wait."
-        )
+    s = SESSIONS.setdefault(
+        c.session,
+        {"ticket": [], "slips": [], "codes": []}
+    )
 
     try:
-
-        s = SESSIONS.setdefault(
-            session_id,
-            {
-                "history": [],
-                "ticket": [],
-                "slips": [],
-                "codes": []
-            }
-        )
-
-        # -------------------------------------------------
-        # 1. CHECK PREDICTION REQUEST
-        # -------------------------------------------------
-
-        prediction_request = detect_prediction_request(message)
-
-        if prediction_request:
-
-            try:
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(
-                        prediction_engine.predict,
-                        sportapi_module=sportapi,
-                        sportybet_module=sportybet,
-                        count=prediction_request["count"],
-                        league=prediction_request["league"]
-                    )
-                    result = future.result(timeout=50)
-
-                if not isinstance(result, dict):
-
-                    raise ValueError(
-                        "Prediction engine returned an invalid response."
-                    )
-
-            except concurrent.futures.TimeoutError:
-                raise HTTPException(
-                    status_code=504,
-                    detail="The prediction engine took too long to respond. Please try again."
-                )
-            except Exception as e:
-
-                traceback.print_exc()
-
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Prediction engine error: {str(e)}"
-                )
-
-            return {
-                "reply": result.get(
-                    "reply",
-                    "I couldn't find suitable predictions."
-                ),
-                "ticket": s["ticket"],
-                "codes": s["codes"],
-                "predictions": result.get("ticket", []),
-                "booking_created": False,
-                "ai_enabled": False,
-                "prediction_engine": "Python",
-                "elapsed_seconds": round(
-                    time.time() - started,
-                    2
-                )
-            }
-
-        # -------------------------------------------------
-        # 2. GROQ IS DISABLED
-        # -------------------------------------------------
-
-        if not GROQ_ENABLED:
-
-            return {
-                "reply": (
-                    "BetOracle is currently running in no-AI test mode. "
-                    "Football predictions are handled by the Python "
-                    "prediction engine. Natural-language chat, ticket "
-                    "commands and booking-code conversion are temporarily "
-                    "unavailable through chat."
-                ),
-                "ticket": s["ticket"],
-                "codes": s["codes"],
-                "predictions": [],
-                "booking_created": False,
-                "ai_enabled": False,
-                "elapsed_seconds": round(
-                    time.time() - started,
-                    2
-                )
-            }
-
-        # -------------------------------------------------
-        # 3. NORMAL CHAT GOES TO GROQ
-        # THIS SECTION RUNS ONLY WHEN GROQ_ENABLED = TRUE
-        # -------------------------------------------------
-
-        msgs = s["history"]
-        previous_length = len(msgs)
-
-        msgs.append({
-            "role": "user",
-            "content": message
-        })
-
-        reply = ""
-
-        for step in range(MAX_STEPS):
-
-            r = groq_request(
-                [
-                    {
-                        "role": "system",
-                        "content": SYSTEM
-                    }
-                ] + msgs
-            )
-
-            assistant_message = {
-                "role": "assistant",
-                "content": r.get("content") or ""
-            }
-
-            tool_calls = r.get("tool_calls") or []
-
-            if tool_calls:
-
-                assistant_message["tool_calls"] = tool_calls
-
-            msgs.append(assistant_message)
-
-            if not tool_calls:
-
-                reply = (
-                    r.get("content") or ""
-                ).strip()
-
-                break
-
-            for call in tool_calls:
-
-                function = call.get("function", {})
-                tool_name = function.get("name")
-
-                raw_args = (
-                    function.get("arguments") or "{}"
-                )
-
-                try:
-
-                    if isinstance(raw_args, str):
-
-                        arguments = json.loads(raw_args)
-
-                    else:
-
-                        arguments = raw_args
-
-                    if not isinstance(arguments, dict):
-
-                        arguments = {}
-
-                    result = run_tool(
-                        tool_name,
-                        arguments,
-                        s
-                    )
-
-                except Exception as e:
-
-                    result = {
-                        "error": f"{type(e).__name__}: {e}"
-                    }
-
-                msgs.append({
-                    "role": "tool",
-                    "tool_call_id": call["id"],
-                    "content": compact(result)
-                })
-
-        # -------------------------------------------------
-        # 4. FINAL RESPONSE
-        # -------------------------------------------------
-
-        if not reply:
-
-            msgs.append({
-                "role": "user",
-                "content": (
-                    "Now reply in plain text. Include booking codes "
-                    "only if a booking tool actually created one. "
-                    "List the picks, odds and available statistics. "
-                    "Explain any failed operations."
-                )
-            })
-
-            final = groq_request(
-                [
-                    {
-                        "role": "system",
-                        "content": SYSTEM
-                    }
-                ] + msgs,
-                use_tools=False
-            )
-
-            reply = (
-                final.get("content") or ""
-            ).strip()
-
-            msgs.append({
-                "role": "assistant",
-                "content": reply
-            })
-
-        if not reply:
-
-            reply = (
-                "I couldn't finish that. Try a more specific request."
-            )
-
-        trim_history(msgs)
-
-        return {
-            "reply": reply,
-            "ticket": s["ticket"],
-            "codes": s["codes"],
-            "elapsed_seconds": round(
-                time.time() - started,
-                2
-            )
-        }
-
-    except HTTPException:
-
-        raise
+        reply = handle(c.message, s)
 
     except Exception as e:
-
         traceback.print_exc()
+        reply = f"Something went wrong: {type(e).__name__}: {e}"
 
-        print("CHAT ERROR:", e)
-
-        if "msgs" in locals():
-
-            del msgs[previous_length:]
-
-        raise HTTPException(
-            status_code=502,
-            detail=str(e)
-        )
-
-    finally:
-
-        lock.release()
+    return {
+        "reply": reply,
+        "ticket": s["ticket"],
+        "codes": s["codes"]
+    }
 
 
-# =========================================================
-# DEBUG ENDPOINT
-# TEMPORARY: USE THIS TO SEE WHAT THE APIS ARE RETURNING
-# =========================================================
+@app.get("/api/debug-markets")
+def debug_markets(home: str, away: str, search: str = ""):
+    """Shows the raw SportyBet market data for a match. Use it to fix market matching."""
 
-@app.get("/api/debug-engine")
-def debug_engine():
     try:
-        # Fetch fixtures for today
-        fixtures = sportapi.fixtures("football", date.today().isoformat(), date.today().isoformat(), None)
-        
-        if not fixtures:
-            return {"error": "No fixtures returned at all."}
-            
-        # Grab the first fixture
-        fx = fixtures[0] if isinstance(fixtures, list) else fixtures.get("response", [{}])[0]
-        
-        home = fx.get("home", {}).get("name") if isinstance(fx.get("home"), dict) else fx.get("home")
-        away = fx.get("away", {}).get("name") if isinstance(fx.get("away"), dict) else fx.get("away")
-        
-        home_id = fx.get("home_id")
-        away_id = fx.get("away_id")
-        league_id = fx.get("league_id")
-        
-        if not home_id:
-            return {"error": "Could not extract team IDs", "raw_fixture": fx}
-
-        # Fetch stats
-        stats = sportapi.stats("football", home_id, away_id, league_id)
-        
-        # Fetch markets
-        markets = sportybet.get_markets("football", home, away)
-
-        return {
-            "fixture_found": f"{home} vs {away}",
-            "raw_stats_returned": stats,
-            "raw_markets_returned": markets
-        }
+        return sportybet.get_markets("football", home, away, search or None)
     except Exception as e:
-        return {"error": str(e), "traceback": traceback.format_exc()}
+        return {"error": f"{type(e).__name__}: {e}"}
 
-
-# =========================================================
-# USAGE ENDPOINT
-# =========================================================
 
 @app.get("/api/usage")
 def usage():
+    return {"sportapi_calls_today": count_call() - 1}
 
-    return {
-        "sportapi_calls_today": count_call() - 1
-    }
-
-
-# =========================================================
-# BOOKMAKER ENDPOINT
-# =========================================================
 
 @app.get("/api/bookmakers")
 def bookmaker_status():
-
     return {
-        key: {
-            "label": value["label"],
-            **bookmakers.caps(key)
-        }
-        for key, value in bookmakers.BOOKMAKERS.items()
+        k: {"label": v["label"], **bookmakers.caps(k)}
+        for k, v in bookmakers.BOOKMAKERS.items()
     }
 
-
-# =========================================================
-# HEALTH CHECK
-# =========================================================
 
 @app.get("/health")
 def health():
-
-    return {
-        "ok": True,
-        "ai": "Disabled for testing",
-        "model": MODEL,
-        "groq_enabled": GROQ_ENABLED,
-        "chat_engine": "Disabled",
-        "prediction_engine": "Python",
-        "api_key_configured": bool(GROQ_API_KEY),
-        "groq_timeout_seconds": GROQ_TIMEOUT,
-        "groq_retries": GROQ_RETRIES,
-        "max_tool_steps": MAX_STEPS
-    }
+    return {"ok": True, "mode": "rule-based (no AI)"}
 
 
-# =========================================================
-# FRONTEND
-# =========================================================
-
-STATIC_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "static"
+app.mount(
+    "/",
+    StaticFiles(
+        directory=os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "static"
+        ),
+        html=True
+    )
 )
 
-if os.path.isdir(STATIC_DIR):
 
-    app.mount(
-        "/",
-        StaticFiles(
-            directory=STATIC_DIR,
-            html=True
-        )
-    )
-
-
-# =========================================================
-# RUN LOCALLY
-# =========================================================
-
+# Run locally:
 # uvicorn app:app --reload
