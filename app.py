@@ -931,7 +931,7 @@ def build_ticket(t, s):
         )
 
     total_found = len(evs)
-    ranked = rank_events(evs, market, MAX_ANALYSE)
+    ranked = rank_events(evs, market, 250)          # best-looking first, by SportyBet's own odds
 
     # ---- 2. SportAPI fixtures for those days (1 call per day, remembered)
     dates = sorted({datetime.fromtimestamp(e["ms"] / 1000, timezone.utc).date() for e in ranked})
@@ -945,23 +945,34 @@ def build_ticket(t, s):
                 return f"SportAPI daily limit reached. It resets at 00:00 UTC. ({e})"
             print("FIXTURES ERROR:", d, e, flush=True)
 
+    # keep only matches the stats provider knows (free: no API calls), still in ranked order
+    pairs_all, unmatched = [], 0
+
+    for ev in ranked:
+        fx = match_fixture(ev, fixtures)
+        if fx:
+            pairs_all.append((ev, fx))
+        else:
+            unmatched += 1
+
+    if not pairs_all:
+        return (
+            f"None of the {len(ranked)} best-looking {league_label} matches for {when} are covered by "
+            f"my stats provider ({len(fixtures)} fixtures loaded), so I cannot check their form. "
+            f"Try naming a league, for example \"Premier League\" or \"Europa League\"."
+        )
+
     # ---- 3. check form in rounds, stop as soon as there are enough strong matches
     cands, checked, no_stats, unfinished = [], 0, 0, 0
+    pairs_all = pairs_all[:MAX_ANALYSE]
 
-    for i in range(0, len(ranked), BATCH):
+    for i in range(0, len(pairs_all), BATCH):
         remaining = TOTAL_BUDGET - (time.time() - t0)
 
         if i > 0 and remaining < 15:
             break
 
-        pairs = []
-
-        for ev in ranked[i:i + BATCH]:
-            fx = match_fixture(ev, fixtures)
-            if fx:
-                pairs.append((ev, fx))
-            else:
-                no_stats += 1
+        pairs = pairs_all[i:i + BATCH]
 
         forms, unf = load_forms([fx for _, fx in pairs], max(8, min(FORM_BUDGET, remaining - 8)))
         unfinished += unf
@@ -984,8 +995,8 @@ def build_ticket(t, s):
     if not cands:
         return (
             f"I checked the form of {checked} {league_label} matches for {when} "
-            f"(of {total_found} on SportyBet), but none passed the stats check "
-            f"({no_stats} had no usable form data). I would rather give you nothing than weak picks. "
+            f"({total_found} on SportyBet; {no_stats} covered matches had no usable form data), "
+            f"but none passed the stats check. I would rather give you nothing than weak picks. "
             f"Say \"risky\" if you want me to relax the check."
         )
 
