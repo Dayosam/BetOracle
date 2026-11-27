@@ -146,6 +146,10 @@ PICK_SPECS = {
     "gg":     ("29", "",           "74", "GG/NG",         "Yes"),
     "over25": ("18", "total=2.5",  "12", "Over/Under 2.5", "Over 2.5"),
     "over15": ("18", "total=1.5",  "12", "Over/Under 1.5", "Over 1.5"),
+    "win_home": ("1",  "",  "1",  "1X2",          "Home"),
+    "win_away": ("1",  "",  "3",  "1X2",          "Away"),
+    "dc_1x":    ("10", "",  "9",  "Double Chance", "Home or Draw"),
+    "dc_x2":    ("10", "",  "11", "Double Chance", "Draw or Away"),
 }
 
 
