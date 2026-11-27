@@ -128,10 +128,9 @@ def parse_numbers(t):
     return count, target
 
 
-EXCLUDE = (
-    "caf", "afc", "concacaf", "conmebol", "women",
-    "u17", "u19", "u20", "u21", "u23", "youth"
-)
+# Only other continents' "Champions League" style cups are dropped for European requests.
+# Nothing else is excluded: women's, youth and every other league stay in.
+EXCLUDE = ("caf", "afc", "concacaf", "conmebol")
 
 LEAGUE_GROUPS = [
     (("europa league",), ("europa league",), "Europa League"),
@@ -711,6 +710,12 @@ def build_ticket(t, s):
             "The stats check worked, but SportyBet did not return any odds, so I cannot "
             "make a booking code right now. These are the matches that passed:\n\n"
             + "\n\n".join(picks)
+            + "\n\nQuick list to add by hand in the SportyBet app:\n"
+            + "\n".join(
+                f"• {c['f']['home_team']} v {c['f']['away_team']} - "
+                f"{MARKETS[c['key']]['market']}: {MARKETS[c['key']]['pick']}"
+                for c in cands[: (count or 8)]
+            )
             + "\n\nWhy no code: " + why
             + (
                 "\n\nSportyBet is blocking this server's connection. Run BetOracle on your own "
