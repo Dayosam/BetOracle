@@ -93,7 +93,12 @@ async function send(msg){
  document.getElementById('hero')?.remove();
  add('u',msg);const w=add('a dots','Thinking…');
  try{
-  const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session:sid,message:msg})});
+  const ctl=new AbortController();
+  const killer=setTimeout(()=>ctl.abort(),110000);
+  const hint=setTimeout(()=>{if(w.classList.contains('dots'))w.textContent='Still working, checking stats…'},15000);
+  let r;
+  try{r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session:sid,message:msg}),signal:ctl.signal})}
+  finally{clearTimeout(killer);clearTimeout(hint)}
   let d=null;
   try{d=await r.json()}catch(_){d=null}
   if(!r.ok){w.className='m a err';w.textContent=errText(r,d);return}
@@ -101,7 +106,9 @@ async function send(msg){
   w.textContent=(d&&d.reply)||'The AI returned no text. Please try again.';
   codes((d&&d.codes)||[]);slip((d&&d.ticket)||[])
  }catch(e){
-  w.className='m a err';w.textContent='Cannot reach the server. Check your connection and try again.'
+  w.className='m a err';w.textContent=(e&&e.name==='AbortError')
+   ?'That took too long and was stopped. Try again in a minute (loaded stats are cached, so it will be faster).'
+   :'Cannot reach the server. Check your connection and try again.'
  }finally{setBusy(false)}
 }
 
