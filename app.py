@@ -24,6 +24,7 @@ import unicodedata
 
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
+from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, wait
 
 from dotenv import load_dotenv
@@ -46,14 +47,14 @@ from cache import count_call
 
 load_dotenv()
 
-MAX_ANALYSE = int(os.getenv("MAX_ANALYSE", "32"))        # most matches whose form is checked per request
+MAX_ANALYSE = int(os.getenv("MAX_ANALYSE", "48"))        # most matches whose form is checked per request
 BATCH = int(os.getenv("BATCH", "8"))                     # matches checked per round (it stops once it has enough)
 TOTAL_BUDGET = float(os.getenv("TOTAL_BUDGET", "80"))    # seconds for the whole request
 FORM_BUDGET = float(os.getenv("FORM_BUDGET", "30"))      # seconds allowed for loading team stats
 EVENTS_BUDGET = float(os.getenv("EVENTS_BUDGET", "50"))  # seconds allowed for SportyBet's match list
 MARKET_BUDGET = float(os.getenv("MARKET_BUDGET", "20"))  # seconds allowed for extra SportyBet lookups
 GG_MAX_AUTO = int(os.getenv("GG_MAX_AUTO", "1"))         # most GG picks in a "best picks" (mixed) ticket
-UP_MIN_ODDS = float(os.getenv("UP_MIN_ODDS", "1.20"))    # 1UP / 2UP odds below this are not used
+UP_MIN_ODDS = float(os.getenv("UP_MIN_ODDS", "1.10"))    # 1UP / 2UP odds below this are not used
 FORM_N = 10                                              # last N finished matches per team
 MIN_FORM = 6                                             # need at least this many matches of data
 
@@ -79,6 +80,7 @@ def slugify(name):
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
 
 
+@lru_cache(maxsize=20000)
 def team_norm(name):
     n = unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode().lower()
     n = re.sub(r"[^a-z0-9 ]", " ", n)
@@ -128,6 +130,73 @@ def kick_time(f):
         return dt.astimezone(WAT).strftime("%a %d %b, %I:%M %p")
     except Exception:
         return raw
+
+
+# =========================================================
+# COUNTRY FLAGS
+# =========================================================
+
+COUNTRY_ISO = {
+    "albania": "AL", "algeria": "DZ", "andorra": "AD", "angola": "AO", "argentina": "AR", "armenia": "AM",
+    "australia": "AU", "austria": "AT", "azerbaijan": "AZ", "bahrain": "BH", "bangladesh": "BD", "belarus": "BY",
+    "belgium": "BE", "bolivia": "BO", "bosnia and herzegovina": "BA", "bosnia & herzegovina": "BA", "brazil": "BR",
+    "bulgaria": "BG", "cameroon": "CM", "canada": "CA", "chile": "CL", "china": "CN", "colombia": "CO",
+    "costa rica": "CR", "croatia": "HR", "cyprus": "CY", "czech republic": "CZ", "czechia": "CZ", "denmark": "DK",
+    "ecuador": "EC", "egypt": "EG", "el salvador": "SV", "estonia": "EE", "ethiopia": "ET", "faroe islands": "FO",
+    "finland": "FI", "france": "FR", "georgia": "GE", "germany": "DE", "ghana": "GH", "greece": "GR",
+    "guatemala": "GT", "honduras": "HN", "hong kong": "HK", "hungary": "HU", "iceland": "IS", "india": "IN",
+    "indonesia": "ID", "iran": "IR", "iraq": "IQ", "ireland": "IE", "republic of ireland": "IE", "israel": "IL",
+    "italy": "IT", "ivory coast": "CI", "jamaica": "JM", "japan": "JP", "jordan": "JO", "kazakhstan": "KZ",
+    "kenya": "KE", "kosovo": "XK", "kuwait": "KW", "latvia": "LV", "lebanon": "LB", "lithuania": "LT",
+    "luxembourg": "LU", "malaysia": "MY", "malta": "MT", "mexico": "MX", "moldova": "MD", "montenegro": "ME",
+    "morocco": "MA", "netherlands": "NL", "new zealand": "NZ", "nigeria": "NG", "north macedonia": "MK",
+    "northern ireland": "GB", "norway": "NO", "oman": "OM", "panama": "PA", "paraguay": "PY", "peru": "PE",
+    "philippines": "PH", "poland": "PL", "portugal": "PT", "qatar": "QA", "romania": "RO", "russia": "RU",
+    "saudi arabia": "SA", "senegal": "SN", "serbia": "RS", "singapore": "SG", "slovakia": "SK", "slovenia": "SI",
+    "south africa": "ZA", "south korea": "KR", "spain": "ES", "sweden": "SE", "switzerland": "CH", "syria": "SY",
+    "tanzania": "TZ", "thailand": "TH", "tunisia": "TN", "turkey": "TR", "turkiye": "TR", "uganda": "UG",
+    "ukraine": "UA", "united arab emirates": "AE", "uruguay": "UY", "usa": "US", "united states": "US",
+    "uzbekistan": "UZ", "venezuela": "VE", "vietnam": "VN", "zambia": "ZM", "zimbabwe": "ZW", "europe": "EU",
+}
+
+
+def _tag_flag(name):
+    """England / Scotland / Wales flags (emoji tag sequences)."""
+    return "\U0001F3F4" + "".join(chr(0xE0000 + ord(c)) for c in name) + "\U000E007F"
+
+
+COUNTRY_SPECIAL = {
+    "england": _tag_flag("gbeng"),
+    "scotland": _tag_flag("gbsct"),
+    "wales": _tag_flag("gbwls"),
+}
+
+
+def flag_for(country):
+    n = unicodedata.normalize("NFKD", str(country or "")).encode("ascii", "ignore").decode().lower().strip()
+
+    if n in COUNTRY_SPECIAL:
+        return COUNTRY_SPECIAL[n]
+
+    iso = COUNTRY_ISO.get(n)
+
+    if iso:
+        return "".join(chr(0x1F1E6 + ord(c) - 65) for c in iso)
+
+    return "\U0001F30D"      # globe for international / unknown
+
+
+def place_line(x, when_txt=""):
+    """'🇮🇹 Italy · Serie A · 8:45 pm'"""
+    country = x.get("country") or ""
+    tournament = x.get("tournament") or ""
+
+    if country:
+        parts = [f"{flag_for(country)} {country}", tournament, when_txt]
+    else:
+        parts = ["\U0001F30D " + (x.get("league") or "").strip(), when_txt]
+
+    return " · ".join(p for p in parts if p and p.strip())
 
 
 # =========================================================
@@ -848,6 +917,8 @@ def make_leg(c, pick):
         "odds": pick["odds"],
         "reason": reason_text(c["key"], f, c["h"], c["a"]) + extra_notes(c),
         "league": f.get("league_name", ""),
+        "country": f.get("country", ""),
+        "tournament": f.get("tournament", ""),
         "kickoff_label": kick_time(f),
         "kickoff_short": kick_short(f),
     }
@@ -856,7 +927,7 @@ def make_leg(c, pick):
 def resolve_pick(c, allow_up_lookup=True):
     """Find the SportyBet selection (ref + odds) for a candidate.
     1UP / 2UP come from the event page; everything else from the match list.
-    Returns None if SportyBet does not offer it."""
+    Returns (pick, why). pick is None when SportyBet does not offer it, and why says why."""
 
     key, ev, f = c["key"], c["ev"], c["f"]
     spec = MARKETS[key]
@@ -865,33 +936,56 @@ def resolve_pick(c, allow_up_lookup=True):
         n, side = UP_KEYS[key]
         team = f["home_team"] if side == "home" else f["away_team"]
 
-        p = None
+        p, why = None, ""
+
         if allow_up_lookup:
             try:
-                p = sportybet.up_pick(ev, n, side, UP_MIN_ODDS)
+                p, why = sportybet.up_lookup(ev, n, side, UP_MIN_ODDS)
             except Exception as e:
+                p, why = None, f"{n}UP lookup failed ({type(e).__name__})"
                 print("UP LOOKUP ERROR:", f["home_team"], "v", f["away_team"], type(e).__name__, e, flush=True)
+        else:
+            why = "too many 1UP/2UP lookups for one request"
 
         if p:
             return {"ref": p["ref"], "odds": p["odds"], "market": p["market"],
-                    "pick": p["pick"], "show": f"{team} {n}UP"}
+                    "pick": p["pick"], "show": f"{team} {n}UP"}, ""
 
         if n == 2:
-            # 2UP not listed or too low: fall back to the plain win so the match is not lost
-            s = sportybet.market_pick(ev, key)
-            if s:
-                return {"ref": s["ref"], "odds": s["odds"], "market": s["market"],
-                        "pick": s["pick"], "show": f"{team} to win (no 2UP listed)"}
+            # 2UP not usable: fall back to the plain win so the match is not lost
+            sp = sportybet.market_pick(ev, key)
+            if sp:
+                return {"ref": sp["ref"], "odds": sp["odds"], "market": sp["market"],
+                        "pick": sp["pick"], "show": f"{team} to win (2UP unavailable)"}, ""
 
-        return None
+        return None, why
 
     p = sportybet.market_pick(ev, key)
 
     if p:
         return {"ref": p["ref"], "odds": p["odds"], "market": p["market"],
-                "pick": p["pick"], "show": spec["show"]}
+                "pick": p["pick"], "show": spec["show"]}, ""
 
-    return None
+    return None, "market not listed on SportyBet"
+
+
+def warm_up_pages(cands, limit=16):
+    """Load the SportyBet event pages of the first 1UP / 2UP candidates in parallel."""
+
+    ids = []
+    for c in cands:
+        if c["key"] in UP_KEYS and c["ev"]["event_id"] not in ids:
+            ids.append(c["ev"]["event_id"])
+        if len(ids) >= limit:
+            break
+
+    if not ids:
+        return
+
+    ex = ThreadPoolExecutor(max_workers=4)
+    futs = [ex.submit(sportybet.event_markets, i) for i in ids]
+    wait(futs, timeout=MARKET_BUDGET)
+    ex.shutdown(wait=False, cancel_futures=True)
 
 
 def warm_sportybet():
@@ -938,13 +1032,13 @@ def format_legs(legs):
 
     for i, x in enumerate(legs, 1):
         when_txt = x.get("kickoff_short") or x.get("kickoff_label") or ""
-        place = " · ".join(p for p in (x.get("league", ""), when_txt) if p)
+        place = place_line(x, when_txt)
         shown = x.get("show") or f"{x.get('market', '')} {x.get('pick', '')}".strip()
 
         lines = [f"**{i}. {x['home']} vs {x['away']}**"]
 
         if place:
-            lines.append(f"🌍 {place}")
+            lines.append(place)
 
         lines.append(f"🎯 **{shown} @{x['odds']:.2f}**")
 
@@ -1038,6 +1132,8 @@ def display_fixture(ev):
         "home_team": ev["home"],
         "away_team": ev["away"],
         "league_name": ev["league"],
+        "country": ev.get("country", ""),
+        "tournament": ev.get("tournament", ""),
         "kickoff_utc": iso_from_ms(ev["ms"]),
     }
 
@@ -1079,7 +1175,7 @@ def build_ticket(t, s):
         )
 
     total_found = len(evs)
-    ranked = rank_events(evs, market, 250)          # best-looking first, by SportyBet's own odds
+    ranked = rank_events(evs, market, 1000)         # best-looking first, by SportyBet's own odds
 
     # ---- 2. SportAPI fixtures for those days (1 call per day, remembered)
     dates = sorted({datetime.fromtimestamp(e["ms"] / 1000, timezone.utc).date() for e in ranked})
@@ -1110,8 +1206,10 @@ def build_ticket(t, s):
             f"Try naming a league, for example \"Premier League\" or \"Europa League\"."
         )
 
+    covered = len(pairs_all)
+
     # ---- 3. check form in rounds, stop as soon as there are enough strong matches
-    cands, checked, no_stats, unfinished = [], 0, 0, 0
+    cands, checked_pairs, checked, no_stats, unfinished = [], [], 0, 0, 0
     pairs_all = pairs_all[:MAX_ANALYSE]
 
     for i in range(0, len(pairs_all), BATCH):
@@ -1131,6 +1229,7 @@ def build_ticket(t, s):
                 no_stats += 1
                 continue
             checked += 1
+            checked_pairs.append((ev, h, a))
             c = evaluate(display_fixture(ev), h, a, market, ev, loose)
             if c:
                 cands.append(c)
@@ -1140,69 +1239,89 @@ def build_ticket(t, s):
 
     cands.sort(key=lambda c: -c["margin"])
 
-    if not cands:
-        return (
-            f"I checked the form of {checked} {league_label} matches for {when} "
-            f"({total_found} on SportyBet; {no_stats} covered matches had no usable form data), "
-            f"but none passed the stats check (including the Over 1.5 check). "
-            f"I would rather give you nothing than weak picks. "
-            f"Say \"risky\" if you want me to relax the check."
-        )
-
     # ---- 4. build the ticket with the odds from SportyBet
-    legs, skipped = [], []
-    gg_n = 0
-    fallback_left = (count or 8) + 3
-    up_lookups_left = (count or 8) + 6          # 1UP / 2UP need one SportyBet event page each
+    legs, skipped, used = [], [], set()
+    state = {"gg": 0, "fb": (count or 8) + 3, "up": (count or 8) + 8}
 
-    for c in cands:
+    def done():
         if count and len(legs) >= count:
-            break
+            return True
         if target and legs and prod(legs) >= target:
-            break
+            return True
+        return False
 
-        # a mixed ticket carries at most GG_MAX_AUTO GG pick
-        if market == "auto" and c["key"] == "gg" and gg_n >= GG_MAX_AUTO:
-            continue
+    def fill(cand_list, relaxed):
+        warm_up_pages(cand_list)
 
-        # stop the SportyBet lookups if the request is running out of time
-        if time.time() - t0 > TOTAL_BUDGET + 25:
-            break
+        for c in cand_list:
+            if done():
+                break
 
-        is_up = c["key"] in UP_KEYS
-        pick = resolve_pick(c, allow_up_lookup=(up_lookups_left > 0)) if is_up else resolve_pick(c)
+            eid = c["ev"]["event_id"]
 
-        if is_up and up_lookups_left > 0:
-            up_lookups_left -= 1
+            if eid in used:
+                continue
 
-        if pick:
-            legs.append(make_leg(c, pick))
-            if c["key"] == "gg":
-                gg_n += 1
-            continue
+            # a mixed ticket carries at most GG_MAX_AUTO GG pick
+            if market == "auto" and c["key"] == "gg" and state["gg"] >= GG_MAX_AUTO:
+                continue
 
-        if is_up:
+            # stop the SportyBet lookups if the request is running out of time
+            if time.time() - t0 > TOTAL_BUDGET + 25:
+                break
+
             f = c["f"]
-            skipped.append(f"{f['home_team']} vs {f['away_team']}: 1UP/2UP not offered on SportyBet")
-            continue
+            name = f"{f['home_team']} vs {f['away_team']}"
+            is_up = c["key"] in UP_KEYS
 
-        if fallback_left <= 0:
-            continue
+            pick, why = resolve_pick(c, allow_up_lookup=(state["up"] > 0))
 
-        fallback_left -= 1
-        _, leg, why = lookup_leg(c)
+            if is_up and state["up"] > 0:
+                state["up"] -= 1
 
-        if leg:
+            leg = make_leg(c, pick) if pick else None
+
+            if not leg and not is_up and state["fb"] > 0:
+                state["fb"] -= 1
+                _, leg, why = lookup_leg(c)
+
+            if not leg:
+                skipped.append(f"{name}: {why}")
+                continue
+
+            leg["relaxed"] = relaxed
             legs.append(leg)
+            used.add(eid)
+
             if c["key"] == "gg":
-                gg_n += 1
-        else:
-            f = c["f"]
-            skipped.append(f"{f['home_team']} vs {f['away_team']}: {why}")
+                state["gg"] += 1
+
+    fill(cands, loose)
+
+    # not enough? use the SAME loaded form data with a relaxed check (no extra API calls)
+    relaxed_n = 0
+
+    if not done() and not loose:
+        extra = []
+
+        for ev, h, a in checked_pairs:
+            if ev["event_id"] in used:
+                continue
+            c = evaluate(display_fixture(ev), h, a, market, ev, True)
+            if c:
+                extra.append(c)
+
+        extra.sort(key=lambda c: -c["margin"])
+
+        before = len(legs)
+        fill(extra, True)
+        relaxed_n = len(legs) - before
 
     if not legs:
         return (
-            "Matches passed the stats check, but I could not read their odds on SportyBet.\n"
+            f"I checked the form of {checked} {league_label} matches for {when} "
+            f"({total_found} on SportyBet; only {covered} have stats data, {no_stats} had no usable form), "
+            f"but none passed the stats checks.\n"
             + "\n".join(skipped[:5])
         )
 
@@ -1213,14 +1332,16 @@ def build_ticket(t, s):
     title = TITLES.get(market, "Ticket")
     total = prod(legs)
 
+    short = bool((count and len(legs) < count) or (target and total < target * 0.9))
+
     if count and len(legs) < count:
-        head = f"🎟 **{title} — {len(legs)} of {count} {when}, strongest picks only**"
+        head = f"🎟 **{title} — {len(legs)} of {count} {when}**"
     else:
         head = f"🎟 **{title} — {len(legs)} legs, {total} odds**"
 
     try:
         item = book_legs(legs, s)
-        code_line = f"📋 Code: **{item['code']}** — {item['games']} games, {item['odds']} odds."
+        code_line = f"📋 Code: [[code:{item['code']}]] — {item['games']} games, {item['odds']} odds."
     except Exception as e:
         code_line = (
             f"Ticket built, but SportyBet booking failed: {type(e).__name__}: {e}\n"
@@ -1229,16 +1350,16 @@ def build_ticket(t, s):
 
     notes = []
 
-    if count and len(legs) < count:
+    if relaxed_n:
         notes.append(
-            f"Safe picks only take the strongest matches, so only {len(legs)} cleared, "
-            f"not the {count} you asked for. Say \"risky\" if you want me to relax the check."
+            f"{relaxed_n} pick{'s' if relaxed_n != 1 else ''} used a relaxed stats check to get closer to what you asked for."
         )
 
-    if target and total < target * 0.9:
+    if short:
         notes.append(
-            f"Total odds are {total}, below your {target:g} target, because not enough "
-            f"matches passed the stats check. Say \"risky\" to relax it."
+            f"Only {covered} of the {total_found} SportyBet matches for {when} have stats data "
+            f"({checked} could be form-checked), and only {len(legs)} passed the checks, "
+            f"so this ticket reaches {total} odds."
         )
 
     if unfinished:
@@ -1247,28 +1368,17 @@ def build_ticket(t, s):
             f"Ask again in a minute: what was loaded is remembered, so it will be faster."
         )
 
-    parts = [head]
+    parts = [head, code_line]
 
     if notes:
         parts.append("\n".join(notes))
 
-    parts.append(code_line)
     parts.append("📊 **Picks**\n" + format_legs(legs))
 
     reply = "\n\n".join(parts)
 
-    if skipped:
+    if skipped and short:
         reply += "\n\nSkipped:\n" + "\n".join(skipped[:5])
-
-    scope = "" if league_label == "all leagues" else f"{league_label} "
-
-    reply += (
-        f"\n\nChecked the form of {checked} {scope}matches "
-        f"({total_found} on SportyBet for {when})"
-        + (f"; {no_stats} had no form data." if no_stats else ".")
-    )
-
-    reply += "\nSay \"receipt\" for a shareable image, or \"convert to Bet9ja\" to move this code."
 
     return reply
 
@@ -1401,7 +1511,7 @@ def do_convert(code, target, s):
     if new:
         s["codes"].append(new if isinstance(new, dict) else {"code": new, "games": len(s["ticket"]), "odds": prod(s["ticket"])})
         shown = new.get("code") if isinstance(new, dict) else new
-        reply = f"🎟 {label} CODE: {shown}"
+        reply = f"🎟 {label} CODE: [[code:{shown}]]"
     else:
         reply = f"I could not create a {label} code."
 
@@ -1424,7 +1534,7 @@ def do_book(s):
     except Exception as e:
         return f"SportyBet booking failed: {type(e).__name__}: {e}"
 
-    return f"📋 Code: **{item['code']}** — {item['games']} games, {item['odds']} odds."
+    return f"📋 Code: [[code:{item['code']}]] — {item['games']} games, {item['odds']} odds."
 
 
 def do_remove(t, s):
