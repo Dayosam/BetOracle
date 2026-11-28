@@ -3,18 +3,17 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>BetOracle.ai</title>
 <link rel="icon" href="logo.svg">
-<link href="https://fonts.googleapis.com/css2?family=Archivo:ital,wght@0,700;0,800;1,800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#FFFFFF;--ash:#F1F1F1;--ash2:#E4E4E4;--panel:#F1F1F1;--line:#E4E4E4;--ink:#0B1F3A;--mute:#667286;--violet:#0B1F3A;--gold:#E63A2E;--win:#1E8F5A}
+:root{--f:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;--bg:#FFFFFF;--ash:#F1F1F1;--ash2:#E4E4E4;--panel:#F1F1F1;--line:#E4E4E4;--ink:#0B1F3A;--mute:#667286;--violet:#0B1F3A;--gold:#E63A2E;--win:#1E8F5A}
 *{box-sizing:border-box}html,body{height:100%;margin:0}
-body{background:var(--bg);color:var(--ink);font:17px/1.65 Inter,system-ui,sans-serif;display:flex;flex-direction:column}
+body{background:var(--bg);color:var(--ink);font:17px/1.65 var(--f);display:flex;flex-direction:column}
 header{display:flex;align-items:center;gap:10px;padding:12px 16px;padding-top:calc(12px + env(safe-area-inset-top));border-bottom:1px solid var(--line)}
 header svg{width:38px;height:38px;filter:drop-shadow(0 2px 6px rgba(11,31,58,.2))}
-.wm{font-style:italic;font:italic 800 21px Archivo,system-ui,sans-serif;letter-spacing:-.02em}.wm i{font-style:normal;color:var(--gold)}
+.wm{font-style:italic;font:italic 800 21px var(--f);letter-spacing:-.02em}.wm i{font-style:normal;color:var(--gold)}
 main{flex:1;overflow-y:auto;width:100%;max-width:780px;margin:0 auto;padding:18px 16px;display:flex;flex-direction:column;gap:14px;position:relative}
 .hero{margin:auto;text-align:center;padding:10px 0 20px}
 .hero svg{width:108px;height:108px;filter:drop-shadow(0 10px 28px rgba(11,31,58,.18))}
-.hero h2{font:800 28px Archivo,system-ui,sans-serif;margin:14px 0 4px;letter-spacing:-.02em}
+.hero h2{font:800 28px var(--f);margin:14px 0 4px;letter-spacing:-.02em}
 .hero p{color:var(--mute);margin:0 auto;max-width:340px}
 
 /* messages: user = ash box, BetOracle = plain text on white (like SportyClaw) */
@@ -27,7 +26,7 @@ main{flex:1;overflow-y:auto;width:100%;max-width:780px;margin:0 auto;padding:18p
 .dots{color:var(--mute)}
 
 .slip{background:var(--ash);border-radius:22px;padding:16px 18px}
-.slip h3{font:800 18px Archivo,system-ui,sans-serif;margin:0 0 8px}
+.slip h3{font:800 18px var(--f);margin:0 0 8px}
 .pick{padding:9px 0;border-top:1px solid var(--ash2);font-size:16px}.pick b{font-weight:600}
 .pick .o{float:right;color:var(--ink);font-weight:800;font-variant-numeric:tabular-nums}
 .tot{display:flex;justify-content:space-between;border-top:2px solid var(--ink);margin-top:6px;padding-top:10px;font-weight:800}
@@ -41,6 +40,11 @@ main{flex:1;overflow-y:auto;width:100%;max-width:780px;margin:0 auto;padding:18p
 .code span{color:var(--mute);font-size:15px}
 .code button{background:var(--ink);color:#fff;border:0;border-radius:99px;padding:7px 14px;font:inherit;font-size:14px;font-weight:600;cursor:pointer}
 .code .push{margin-left:auto}
+.cd{display:inline-flex;align-items:center;gap:8px;background:var(--ash);border-radius:10px;padding:2px 6px 2px 12px;vertical-align:middle}
+.cd b{font:800 17px ui-monospace,Menlo,monospace;letter-spacing:.06em}
+.cp{border:0;background:transparent;color:#555;width:30px;height:30px;border-radius:8px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;font:700 16px var(--f);padding:0}
+.cp:hover{background:var(--ash2)}
+.cp svg{width:18px;height:18px}
 
 /* input: ash pill with round up-arrow button */
 form{display:flex;align-items:center;gap:8px;width:calc(100% - 32px);max-width:748px;margin:6px auto calc(14px + env(safe-area-inset-bottom));padding:8px 8px 8px 22px;background:var(--ash);border-radius:34px}
@@ -75,7 +79,12 @@ button:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
 <div id="rc"><img id="rimg" alt="Ticket receipt"><div class="rb"><button class="go" id="rgo">Share / Save</button><button class="no" id="rno">Close</button></div><div class="rh">On iPhone you can also press and hold the image, then tap Save.</div></div>
 <script>
 const log=document.getElementById('log'),inp=document.getElementById('i'),btn=document.getElementById('s'),dn=document.getElementById('dn'),sid=Math.random().toString(36).slice(2);
-let slipEl=null,shown=0,busy=false,lastTicket=[],lastCode='';
+let busy=false,lastTicket=[],lastCode='';
+const COPY_SVG='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg>';
+
+/* ---------- copy button beside the code ---------- */
+log.addEventListener('click',e=>{const k=e.target.closest('.cp');if(!k)return;
+ navigator.clipboard?.writeText(k.dataset.c);k.textContent='✓';setTimeout(()=>{k.innerHTML=COPY_SVG},1500)});
 
 /* ---------- scroll-to-bottom button ---------- */
 function toEnd(){log.scrollTop=log.scrollHeight}
@@ -85,7 +94,7 @@ dn.onclick=()=>{log.scrollTo({top:log.scrollHeight,behavior:'smooth'})};
 /* ---------- chat text: **bold** and "> quote" lines (escaped first, so it is safe) ---------- */
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function fmt(t){
- const b=s=>s.replace(/\*\*(.+?)\*\*/g,'<b>$1</b>');
+ const b=s=>s.replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/\[\[code:([A-Za-z0-9_-]+)\]\]/g,(m,c)=>'<span class="cd"><b>'+c+'</b><button type="button" class="cp" data-c="'+c+'" aria-label="Copy code">'+COPY_SVG+'</button></span>');
  let out='';
  String(t).split('\n').forEach((line,i,all)=>{
   const nl=i<all.length-1?'\n':'';
@@ -122,7 +131,7 @@ function codes(list){
 
 /* ---------- receipt image (drawn in the browser, no server needed) ---------- */
 const BRAND={name:'BetOracle',tld:'.ai',tag:'Stats-backed picks. Smarter slips.',handle:'betoracle.onrender.com'};
-const FONT='Archivo, Inter, system-ui, -apple-system, Arial, sans-serif';
+const FONT='-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
 const EMOJI='"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif';
 const LOGO_SVG='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200"><circle cx="100" cy="100" r="96" fill="#fff"/><mask id="m" maskUnits="userSpaceOnUse" x="-60" y="-60" width="320" height="220"><rect x="-60" y="-60" width="320" height="220" fill="#fff"/><path d="M131-2L141 3L128 36L118 31Z" fill="#000"/></mask><g transform="translate(100 100) scale(.9) translate(-66 -50) skewX(-12)"><path d="M0 0H44C62 0 72 10 72 26C72 36 67 43 59 47C70 51 77 60 77 74C77 91 65 100 46 100H0ZM26 20V40H40C46 40 48 36 48 30C48 24 46 20 40 20ZM26 60V80H42C50 80 53 76 53 70C53 64 50 60 42 60Z" fill="#0B1F3A" fill-rule="evenodd"/><path d="M70 50a42 50 0 1 0 84 0a42 50 0 1 0-84 0ZM94 52a18 26 0 1 0 36 0a18 26 0 1 0-36 0Z" fill="#E63A2E" stroke="#fff" stroke-width="6" stroke-linejoin="round" paint-order="stroke" fill-rule="evenodd" mask="url(#m)"/></g></svg>';
 
@@ -137,7 +146,6 @@ function kickTime(iso){try{const d=new Date(iso);if(isNaN(d))return '';return d.
 function loadImg(src){return new Promise(r=>{const i=new Image();i.onload=()=>r(i);i.onerror=()=>r(null);i.src=src})}
 
 async function buildReceipt(legs,code){
- try{await Promise.all(['800 40px Archivo','700 30px Archivo','italic 800 40px Archivo'].map(f=>document.fonts.load(f)))}catch(e){}
  const logo=await loadImg('data:image/svg+xml;charset=utf-8,'+encodeURIComponent(LOGO_SVG));
  const MAXR=12,n=Math.min(legs.length,MAXR),extra=legs.length-n;
  const W=1565,lastSep=470+110*(n-1),panelTop=lastSep+37,cardBottom=panelTop+136+20,H=cardBottom+155;
@@ -243,7 +251,7 @@ async function send(msg){
   w.innerHTML=fmt((d&&d.reply)||'The server returned no text. Please try again.');
   lastTicket=(d&&d.ticket)||[];
   const cl=(d&&d.codes)||[];if(cl.length)lastCode=cl[cl.length-1].code;
-  codes(cl);slip(lastTicket)
+  w.scrollIntoView({block:'start',behavior:'smooth'})
  }catch(e){
   w.className='m a err';w.textContent=(e&&e.name==='AbortError')
    ?'That took too long and was stopped. Try again in a minute (loaded stats are remembered, so it will be faster).'
