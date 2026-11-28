@@ -1,20 +1,201 @@
-import os, httpx
-from datetime import date, timedelta
+import os, re, time, unicodedata, httpx
+from datetime import date, datetime, timedelta, timezone
 from cache import cached, count_call
 
 BASE = "https://sportapi.ai/api"
 H = lambda: {"X-Api-Key": os.getenv("SPORTAPI_KEY", "")}
 H1, H6, D1, D7 = 1800, 21600, 86400, 604800  # cache lifetimes in seconds
 
+# ---------------------------------------------------------------------------
+# BACKUP API: goal-api.com
+# Used automatically when SportAPI says "limit reached" (HTTP 429).
+# Needs the environment variable GOALAPI_KEY (Render -> Environment).
+# Set FORCE_BACKUP=1 to test the backup even when SportAPI still works.
+# ---------------------------------------------------------------------------
+GOAL_BASE = "https://api.goal-api.com/v1"
+GOAL_FIN = ("FINISHED", "AFTER_ET", "AFTER_PEN")
+
+_LIMIT = {"day": None}      # UTC day on which SportAPI said "limit reached"
+_ID_BY_SLUG = {}            # team slug -> goal-api team id (filled when fixtures are loaded)
+
+try:
+    from zoneinfo import ZoneInfo
+    _BERLIN = ZoneInfo("Europe/Berlin")   # goal-api's matchDate / matchTime are in this timezone
+except Exception:
+    _BERLIN = None
+
+
+class _Limit(Exception):
+    pass
+
+
+def _utc_day():
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _slug(name):
+    s = unicodedata.normalize("NFKD", str(name or "")).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+
+
+def _gget(path, params=None):
+    key = os.getenv("GOALAPI_KEY", "")
+    if not key:
+        raise RuntimeError("SportAPI daily limit reached and no backup key is set (add GOALAPI_KEY).")
+    r = httpx.get(GOAL_BASE + path, headers={"Authorization": "Bearer " + key}, params=params, timeout=25)
+    if r.status_code == 429:
+        raise RuntimeError("Both SportAPI and the backup goal-api have reached their daily limit.")
+    r.raise_for_status()
+    return r.json()
+
+
+def _gpages(path, params, size=100, max_pages=12):
+    out, off = [], 0
+    for _ in range(max_pages):
+        j = _gget(path, {**params, "limit": size, "offset": off})
+        rows = j.get("data") or []
+        out += rows
+        if not rows or not (j.get("pagination") or {}).get("hasMore"):
+            break
+        off += size
+    return out
+
+
+def _kick_utc(f):
+    if f.get("kickoffUtc"):
+        return f["kickoffUtc"]
+    d, t = f.get("matchDate"), f.get("matchTime")
+    if not d or not t:
+        return ""
+    try:
+        dt = datetime.fromisoformat(f"{d}T{t}:00")
+        dt = dt.replace(tzinfo=_BERLIN if _BERLIN else timezone(timedelta(hours=2)))
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return ""
+
+
+def _score(f, side):
+    v = f.get(f"{side}TeamFtScore")
+    if v in (None, ""):
+        v = f.get(f"{side}TeamScore")
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+def _goal_fixtures(day):
+    """Fixtures for one UTC day, in the same shape SportAPI returns."""
+    d = date.fromisoformat(day)
+    params = {"from": d.isoformat(), "to": (d + timedelta(days=1)).isoformat()}
+    try:
+        rows = _gpages("/fixtures", {**params, "status": "SCHEDULED"})
+    except httpx.HTTPStatusError:
+        rows = _gpages("/fixtures", params)
+
+    out = []
+    for f in rows:
+        if f.get("matchStatus") != "SCHEDULED":
+            continue
+        ko = _kick_utc(f)
+        if not ko or ko[:10] != day:
+            continue
+        hn, an = f.get("homeTeamName") or "", f.get("awayTeamName") or ""
+        _ID_BY_SLUG[_slug(hn)] = f.get("homeTeamId")
+        _ID_BY_SLUG[_slug(an)] = f.get("awayTeamId")
+        out.append({
+            "id": f.get("id"), "status": "Scheduled", "kickoff_utc": ko,
+            "home_team": hn, "away_team": an,
+            "home_id": f.get("homeTeamId"), "away_id": f.get("awayTeamId"),
+            "league_id": f.get("leagueId"), "league_name": f.get("leagueName") or "",
+        })
+    return {"data": out}
+
+
+def _goal_team_id(slug):
+    tid = _ID_BY_SLUG.get(slug)
+    if tid:
+        return tid
+    rows = _gget("/teams", {"search": slug.replace("-", " "), "limit": 10}).get("data") or []
+    best = [r for r in rows if _slug(r.get("name")) == slug] or rows
+    if not best:
+        raise RuntimeError(f"backup: team '{slug}' not found")
+    return best[0]["id"]
+
+
+def _goal_results(slug):
+    tid = _goal_team_id(slug)
+    rows = _gget(f"/teams/{tid}/results", {"limit": 15}).get("data") or []
+    out = []
+    for m in rows:
+        if m.get("matchStatus") not in GOAL_FIN:
+            continue
+        hs, as_ = _score(m, "home"), _score(m, "away")
+        if hs is None or as_ is None:
+            continue
+        hn, an = m.get("homeTeamName") or "", m.get("awayTeamName") or ""
+        out.append({
+            "status": "FT", "date": m.get("matchDate") or "",
+            "home_team": hn, "away_team": an,
+            "home_slug": _slug(hn), "away_slug": _slug(an),
+            "home_score": hs, "away_score": as_,
+        })
+    return {"results": out}
+
+
+def _goal_standings(league_id):
+    if str(league_id).isdigit():
+        raise RuntimeError("backup: league id belongs to the other API")
+    rows = _gget(f"/leagues/{league_id}/standings").get("data") or []
+    data = []
+    for r in rows:
+        name = r.get("teamName") or ""
+        _ID_BY_SLUG[_slug(name)] = r.get("teamId")
+        data.append({"team": {"id": r.get("teamId"), "slug": _slug(name), "name": name}})
+    return {"data": data}
+
+
+def _goal_get(path):
+    m = re.match(r"^/fixtures/date/(\d{4}-\d{2}-\d{2})$", path)
+    if m:
+        return _goal_fixtures(m.group(1))
+    m = re.match(r"^/teams/slug/(.+)$", path)
+    if m:
+        return _goal_results(m.group(1))
+    m = re.match(r"^/standings/(.+)$", path)
+    if m:
+        return _goal_standings(m.group(1))
+    raise RuntimeError(f"backup API does not support {path}")
+
+
+# ---------------------------------------------------------------------------
+# MAIN GET (SportAPI first, goal-api backup)
+# ---------------------------------------------------------------------------
 def get(path, ttl):
     def call():
-        count_call()
-        r = httpx.get(BASE + path, headers=H(), timeout=20)
-        if r.status_code == 429: raise RuntimeError("SportAPI daily limit reached. Try again after 00:00 UTC.")
-        r.raise_for_status()
-        return r.json()
+        use_primary = _LIMIT["day"] != _utc_day() and os.getenv("FORCE_BACKUP") != "1"
+
+        if use_primary:
+            try:
+                count_call()
+                r = httpx.get(BASE + path, headers=H(), timeout=20)
+                if r.status_code == 429:
+                    raise _Limit()
+                r.raise_for_status()
+                return r.json()
+            except _Limit:
+                _LIMIT["day"] = _utc_day()
+                print("SPORTAPI LIMIT REACHED: switching to goal-api backup", flush=True)
+
+        print("BACKUP API:", path, flush=True)
+        return _goal_get(path)
     return cached("sportapi:" + path, ttl, call)
 
+
+# ---------------------------------------------------------------------------
+# everything below is unchanged
+# ---------------------------------------------------------------------------
 def days(a, b):
     d, e = date.fromisoformat(a), date.fromisoformat(b)
     return [(d + timedelta(n)).isoformat() for n in range(min((e - d).days + 1, 7))]
@@ -93,7 +274,7 @@ def stats(sport, home_id, away_id, league_id):
 
 KEYS = ("shots", "shots_on_target", "fouls", "tackles", "yellow_cards")
 
-def _slug(league_id, team_id):
+def _team_slug(league_id, team_id):
     for r in get(f"/standings/{league_id}", H6).get("data", []):
         if r["team"]["id"] == team_id: return r["team"]["slug"], r["team"]["name"]
     raise LookupError("team not found in that league table")
@@ -101,7 +282,7 @@ def _slug(league_id, team_id):
 def team_history(team_id, league_id, n=8):
     """Per-match shots, shots on target, fouls, tackles and yellow cards (for and against) over a team's last n matches.
     Finished matches never change, so each match's stats are cached for 30 days."""
-    slug, name = _slug(league_id, team_id)
+    slug, name = _team_slug(league_id, team_id)
     res = [m for m in get(f"/teams/slug/{slug}", H6).get("results", []) if m.get("status") in FIN]
     rows = []
     for m in sorted(res, key=lambda m: m["date"], reverse=True)[:n]:
