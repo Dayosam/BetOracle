@@ -159,13 +159,46 @@ PICK_SPECS = {
     "win_away": ("1",  "",  "3",  "1X2",          "Away"),
     "dc_1x":    ("10", "",  "9",  "Double Chance", "Home or Draw"),
     "dc_x2":    ("10", "",  "11", "Double Chance", "Draw or Away"),
+    "dc_12":    ("10", "",  "10", "Double Chance", "Home or Away"),
+    # these may only be on the event page, not in the match list: use market_pick_any()
+    "under35":  ("18", "total=3.5", "13", "Over/Under 3.5", "Under 3.5"),
+    "ts_home":  ("19", "total=0.5", "12", "Home Team Goals 0.5", "Home Over 0.5"),
+    "ts_away":  ("20", "total=0.5", "12", "Away Team Goals 0.5", "Away Over 0.5"),
 }
 
 
 def market_pick(ev, key):
     """Odds + ref for GG / Over 2.5 / Over 1.5 / 1X2 / DC straight from the event list. None if not listed."""
+    if key not in PICK_SPECS:          # e.g. win-either-half is read from the event page, not the list
+        return None
+
     mid, spec, oid, mname, pname = PICK_SPECS[key]
     for m in ev.get("markets") or []:
+        if str(m.get("id")) != mid or (m.get("specifier") or "") != spec:
+            continue
+        if m.get("status") not in (None, 0):
+            continue
+        for o in m.get("outcomes") or []:
+            if str(o.get("id")) != oid or o.get("isActive") in (False, 0):
+                continue
+            try:
+                odds = float(o["odds"])
+            except Exception:
+                continue
+            return {"odds": odds, "market": mname, "pick": pname,
+                    "ref": f'{ev["event_id"]}|{mid}|{spec}|{oid}'}
+    return None
+
+
+def market_pick_any(ev, key):
+    """Like market_pick, but if the match list does not carry the market, read it from the event page."""
+    p = market_pick(ev, key)
+    if p:
+        return p
+
+    mid, spec, oid, mname, pname = PICK_SPECS[key]
+
+    for m in event_markets(ev["event_id"]):
         if str(m.get("id")) != mid or (m.get("specifier") or "") != spec:
             continue
         if m.get("status") not in (None, 0):
@@ -189,7 +222,7 @@ def market_pick(ev, key):
 # =========================================================
 
 OUT_1X2 = {"home": "1", "draw": "2", "away": "3"}
-UP_MIN_ODDS_DEFAULT = 1.10
+UP_MIN_ODDS_DEFAULT = 1.20
 
 
 def event_markets(event_id):
@@ -241,6 +274,41 @@ def up_lookup(ev, n, side, min_odds=UP_MIN_ODDS_DEFAULT):
 
 def up_pick(ev, n, side, min_odds=UP_MIN_ODDS_DEFAULT):
     return up_lookup(ev, n, side, min_odds)[0]
+
+
+def either_half_lookup(ev, side, min_odds=UP_MIN_ODDS_DEFAULT):
+    """'Win either half' for home or away (found by NAME on the event page, like the SportyTips provider).
+    Returns (pick, why)."""
+    if side not in ("home", "away"):
+        return None, "bad request"
+
+    why = "win either half is not on SportyBet's page for this match"
+
+    for m in event_markets(ev["event_id"]):
+        text = f"{m.get('desc') or ''} {m.get('name') or ''}".lower()
+        if "either half" not in text or "both" in text or "1st" in text or "2nd" in text:
+            continue
+        if m.get("status") not in (None, 0):
+            why = "win either half is suspended right now"
+            continue
+        spec = m.get("specifier") or ""
+        for o in m.get("outcomes") or []:
+            label = str(o.get("desc") or o.get("name") or "").strip().lower()
+            if not (side in label or (side in text and label == "yes")):
+                continue
+            if o.get("isActive") in (False, 0):
+                why = "win either half is suspended right now"
+                continue
+            try:
+                odds = float(o["odds"])
+            except Exception:
+                continue
+            if odds < (min_odds or 0):
+                why = f"win either half odds {odds:.2f} are below the {min_odds:g} minimum"
+                continue
+            return {"odds": odds, "market": "Win Either Half", "pick": "Home" if side == "home" else "Away",
+                    "ref": f'{ev["event_id"]}|{m.get("id")}|{spec}|{o.get("id")}'}, ""
+    return None, why
 
 
 def list_events(sport, date_from, date_to, league=None):
