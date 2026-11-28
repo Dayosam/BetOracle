@@ -132,6 +132,7 @@ def _events_locked(sport):
                     continue          # virtual / e-soccer games have no real form
                 out.append({"event_id": e["eventId"], "home": e["homeTeamName"], "away": e["awayTeamName"],
                             "ms": e["estimateStartTime"], "league": f'{t.get("categoryName", "")} {t.get("name", "")}'.strip(),
+                            "country": t.get("categoryName", "") or "", "tournament": t.get("name", "") or "",
                             "markets": e.get("markets") or []})
         if page * 100 >= d.get("totalNum", 0) or not d.get("tournaments"): break
         page += 1
@@ -188,7 +189,7 @@ def market_pick(ev, key):
 # =========================================================
 
 OUT_1X2 = {"home": "1", "draw": "2", "away": "3"}
-UP_MIN_ODDS_DEFAULT = 1.20
+UP_MIN_ODDS_DEFAULT = 1.10
 
 
 def event_markets(event_id):
@@ -201,19 +202,22 @@ def event_markets(event_id):
     return d.get("markets") or []
 
 
-def up_pick(ev, n, side, min_odds=UP_MIN_ODDS_DEFAULT):
+def up_lookup(ev, n, side, min_odds=UP_MIN_ODDS_DEFAULT):
     """Odds + ref for '1X2 - nUP' (n = 1 or 2), side = 'home' or 'away'.
-    Returns None if SportyBet does not list it, it is suspended, or the odds are below min_odds."""
+    Returns (pick, why): pick is None when it cannot be used and why says exactly why."""
     if n not in (1, 2) or side not in ("home", "away"):
-        return None
+        return None, "bad request"
 
-    pattern = re.compile(r"1x2\W+" + str(n) + r"\s*-?\s*up\b", re.I)
+    pattern = re.compile(r"\b" + str(n) + r"\s*-?\s*up\b", re.I)
+    wrong = re.compile(r"handicap|total|corner|card|half|over|under|goal", re.I)
+    why = f"no {n}UP market on SportyBet's page for this match"
 
     for m in event_markets(ev["event_id"]):
         text = f"{m.get('desc') or ''} {m.get('name') or ''}"
-        if not pattern.search(text):
+        if not pattern.search(text) or wrong.search(text):
             continue
         if m.get("status") not in (None, 0):
+            why = f"{n}UP is suspended right now"
             continue
         spec = m.get("specifier") or ""
         for o in m.get("outcomes") or []:
@@ -221,16 +225,22 @@ def up_pick(ev, n, side, min_odds=UP_MIN_ODDS_DEFAULT):
             if not (label == side or str(o.get("id")) == OUT_1X2[side]):
                 continue
             if o.get("isActive") in (False, 0):
-                return None
+                why = f"{n}UP {side} is suspended right now"
+                continue
             try:
                 odds = float(o["odds"])
             except Exception:
                 continue
             if odds < (min_odds or 0):
-                return None
+                why = f"{n}UP odds {odds:.2f} are below the {min_odds:g} minimum"
+                continue
             return {"odds": odds, "market": f"1X2 - {n}UP", "pick": "Home" if side == "home" else "Away",
-                    "ref": f'{ev["event_id"]}|{m.get("id")}|{spec}|{o.get("id")}'}
-    return None
+                    "ref": f'{ev["event_id"]}|{m.get("id")}|{spec}|{o.get("id")}'}, ""
+    return None, why
+
+
+def up_pick(ev, n, side, min_odds=UP_MIN_ODDS_DEFAULT):
+    return up_lookup(ev, n, side, min_odds)[0]
 
 
 def list_events(sport, date_from, date_to, league=None):
