@@ -45,6 +45,7 @@ main{flex:1;overflow-y:auto;width:100%;max-width:780px;margin:0 auto;padding:18p
 .cp{border:0;background:transparent;color:#555;width:30px;height:30px;border-radius:8px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;font:700 16px var(--f);padding:0}
 .cp:hover{background:var(--ash2)}
 .cp svg{width:18px;height:18px}
+.rcimg{width:100%;max-width:520px;height:auto;border-radius:14px;align-self:flex-start;cursor:pointer;box-shadow:0 2px 14px rgba(0,0,0,.14)}
 
 /* input: ash pill with round up-arrow button */
 form{display:flex;align-items:center;gap:8px;width:calc(100% - 32px);max-width:748px;margin:6px auto calc(14px + env(safe-area-inset-bottom));padding:8px 8px 8px 22px;background:var(--ash);border-radius:34px}
@@ -78,8 +79,19 @@ button:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
 <form id="f"><input id="i" placeholder="Ask BetOracle anything" autocomplete="off"><button id="s" aria-label="Send">↑</button></form>
 <div id="rc"><img id="rimg" alt="Ticket receipt"><div class="rb"><button class="go" id="rgo">Share / Save</button><button class="no" id="rno">Close</button></div><div class="rh">On iPhone you can also press and hold the image, then tap Save.</div></div>
 <script>
-const log=document.getElementById('log'),inp=document.getElementById('i'),btn=document.getElementById('s'),dn=document.getElementById('dn'),sid=Math.random().toString(36).slice(2);
+const log=document.getElementById('log'),inp=document.getElementById('i'),btn=document.getElementById('s'),dn=document.getElementById('dn'),sid=(()=>{try{let v=localStorage.getItem('bo_sid');if(!v){v=Math.random().toString(36).slice(2)+Date.now().toString(36);localStorage.setItem('bo_sid',v)}return v}catch(e){return Math.random().toString(36).slice(2)}})();
 let busy=false,lastTicket=[],lastCode='';
+const KEEP_MS=30*60*1000,SAVE_KEY='bo_chat',heroEl=document.getElementById('hero');
+let saved=[];
+try{saved=JSON.parse(localStorage.getItem(SAVE_KEY)||'[]').filter(e=>Date.now()-e.t<KEEP_MS)}catch(e){saved=[]}
+function persist(){try{localStorage.setItem(SAVE_KEY,JSON.stringify(saved))}catch(e){}}
+function save(e){saved.push(e);persist()}
+function sweep(){
+ const now=Date.now();
+ log.querySelectorAll('[data-t]').forEach(el=>{if(now-Number(el.dataset.t)>KEEP_MS)el.remove()});
+ saved=saved.filter(e=>now-e.t<KEEP_MS);persist();
+ if(!log.querySelector('[data-t]')&&!document.getElementById('hero')&&!busy)log.append(heroEl)}
+setInterval(sweep,30000);
 const COPY_SVG='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg>';
 
 /* ---------- copy button beside the code ---------- */
@@ -103,7 +115,7 @@ function fmt(t){
  });
  return out}
 
-function add(cls,t){const d=document.createElement('div');d.className='m '+cls;d.textContent=t;log.append(d);toEnd();return d}
+function add(cls,t){const d=document.createElement('div');d.className='m '+cls;d.dataset.t=Date.now();d.textContent=t;log.append(d);toEnd();return d}
 
 function pickLabel(x){return x.show||[x.market,x.pick].filter(Boolean).join(': ')}
 
@@ -206,6 +218,16 @@ async function buildReceipt(legs,code){
  return c}
 
 let rcBlob=null;
+async function addReceipt(legs,code,t){
+ try{
+  const c=await buildReceipt(legs,code);
+  await new Promise(res=>c.toBlob(b=>{
+   const url=URL.createObjectURL(b);
+   const im=document.createElement('img');im.src=url;im.className='rcimg';im.alt='BetOracle ticket';im.dataset.t=t||Date.now();
+   im.onclick=()=>{rcBlob=b;document.getElementById('rimg').src=url;document.getElementById('rc').classList.add('on')};
+   log.append(im);res()},'image/png'))
+ }catch(e){}
+}
 async function openReceipt(code){
  const legs=lastTicket;
  if(!legs.length){add('a','Build a ticket first, then say "receipt".');return}
@@ -236,7 +258,7 @@ async function send(msg){
  document.getElementById('hero')?.remove();
  if(/^\s*(receipt|make (a |the )?receipt|generate (a |the )?receipt|ticket image|slip image|image)\s*$/i.test(msg)){add('u',msg);openReceipt();return}
  setBusy(true);
- add('u',msg);const w=add('a dots','Thinking…');
+ const um=add('u',msg);const w=add('a dots','Thinking…');
  try{
   const ctl=new AbortController();
   const killer=setTimeout(()=>ctl.abort(),110000);
@@ -248,16 +270,31 @@ async function send(msg){
   try{d=await r.json()}catch(_){d=null}
   if(!r.ok){w.className='m a err';w.textContent=errText(r,d);return}
   w.className='m a';
-  w.innerHTML=fmt((d&&d.reply)||'The server returned no text. Please try again.');
+  const replyText=(d&&d.reply)||'The server returned no text. Please try again.';
+  w.innerHTML=fmt(replyText);
   lastTicket=(d&&d.ticket)||[];
   const cl=(d&&d.codes)||[];if(cl.length)lastCode=cl[cl.length-1].code;
-  w.scrollIntoView({block:'start',behavior:'smooth'})
+  w.scrollIntoView({block:'start',behavior:'smooth'});
+  const now=Date.now();
+  save({t:now,role:'u',text:msg});
+  save({t:now,role:'a',text:replyText,ticket:(d&&d.fresh)?lastTicket:null,code:lastCode});
+  if(d&&d.fresh&&lastTicket.length)await addReceipt(lastTicket,lastCode,now);
  }catch(e){
   w.className='m a err';w.textContent=(e&&e.name==='AbortError')
    ?'That took too long and was stopped. Try again in a minute (loaded stats are remembered, so it will be faster).'
    :'Cannot reach the server. Check your connection and try again.'
  }finally{setBusy(false)}
 }
+
+(async function restore(){
+ if(!saved.length)return;
+ document.getElementById('hero')?.remove();
+ for(const e of saved){
+  if(e.role==='u'){const d=add('u',e.text);d.dataset.t=e.t}
+  else{const d=document.createElement('div');d.className='m a';d.dataset.t=e.t;d.innerHTML=fmt(e.text);log.append(d);
+   if(e.ticket&&e.ticket.length){lastTicket=e.ticket;lastCode=e.code||'';await addReceipt(e.ticket,e.code,e.t)}}
+ }
+ toEnd()})();
 
 document.getElementById('f').onsubmit=e=>{e.preventDefault();const v=inp.value.trim();if(v&&!busy){inp.value='';send(v)}};
 </script></body></html>
