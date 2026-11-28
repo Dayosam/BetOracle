@@ -13,6 +13,9 @@ This version sends requests EXACTLY the way the working SportyTips provider does
 - The event list (with the GG and Over/Under odds that come with it) is also kept in this
   process's own memory for 30 minutes, and each event page for 5 minutes, so repeat requests
   cost nothing even if cache.py does not keep them.
+
+NEW: 1UP / 2UP markets ("1X2 - 1UP", "1X2 - 2UP"). They are not in the event list, so
+up_pick() reads them from the event page by NAME (same method as the SportyTips provider).
 """
 import os, re, json, time, threading
 from urllib.error import HTTPError, URLError
@@ -159,7 +162,7 @@ PICK_SPECS = {
 
 
 def market_pick(ev, key):
-    """Odds + ref for GG / Over 2.5 / Over 1.5 straight from the event list. None if not listed."""
+    """Odds + ref for GG / Over 2.5 / Over 1.5 / 1X2 / DC straight from the event list. None if not listed."""
     mid, spec, oid, mname, pname = PICK_SPECS[key]
     for m in ev.get("markets") or []:
         if str(m.get("id")) != mid or (m.get("specifier") or "") != spec:
@@ -175,6 +178,58 @@ def market_pick(ev, key):
                 continue
             return {"odds": odds, "market": mname, "pick": pname,
                     "ref": f'{ev["event_id"]}|{mid}|{spec}|{oid}'}
+    return None
+
+
+# =========================================================
+# 1UP / 2UP  ("1X2 - 1UP", "1X2 - 2UP")
+# Not part of the event list, so they are read from the event page by NAME
+# (same method as the working SportyTips provider).
+# =========================================================
+
+OUT_1X2 = {"home": "1", "draw": "2", "away": "3"}
+UP_MIN_ODDS_DEFAULT = 1.20
+
+
+def event_markets(event_id):
+    """All markets of one event (event page, kept 5 minutes in memory and in cache.py)."""
+    hit = _MK_MEM.get(event_id)
+    if hit and time.time() - hit[0] < 300:
+        return hit[1].get("markets") or []
+    d = _get("/factsCenter/event", {"eventId": event_id, "productId": 3}, 300) or {}
+    _MK_MEM[event_id] = (time.time(), d)
+    return d.get("markets") or []
+
+
+def up_pick(ev, n, side, min_odds=UP_MIN_ODDS_DEFAULT):
+    """Odds + ref for '1X2 - nUP' (n = 1 or 2), side = 'home' or 'away'.
+    Returns None if SportyBet does not list it, it is suspended, or the odds are below min_odds."""
+    if n not in (1, 2) or side not in ("home", "away"):
+        return None
+
+    pattern = re.compile(r"1x2\W+" + str(n) + r"\s*-?\s*up\b", re.I)
+
+    for m in event_markets(ev["event_id"]):
+        text = f"{m.get('desc') or ''} {m.get('name') or ''}"
+        if not pattern.search(text):
+            continue
+        if m.get("status") not in (None, 0):
+            continue
+        spec = m.get("specifier") or ""
+        for o in m.get("outcomes") or []:
+            label = str(o.get("desc") or o.get("name") or "").strip().lower()
+            if not (label == side or str(o.get("id")) == OUT_1X2[side]):
+                continue
+            if o.get("isActive") in (False, 0):
+                return None
+            try:
+                odds = float(o["odds"])
+            except Exception:
+                continue
+            if odds < (min_odds or 0):
+                return None
+            return {"odds": odds, "market": f"1X2 - {n}UP", "pick": "Home" if side == "home" else "Away",
+                    "ref": f'{ev["event_id"]}|{m.get("id")}|{spec}|{o.get("id")}'}
     return None
 
 
@@ -199,12 +254,7 @@ def _find(sport, home, away):
 
 def get_markets(sport, home, away, search=None):
     ev = _find(sport, home, away)
-    hit = _MK_MEM.get(ev["event_id"])
-    if hit and time.time() - hit[0] < 300:
-        d = hit[1]
-    else:
-        d = _get("/factsCenter/event", {"eventId": ev["event_id"], "productId": 3}, 300) or {}
-        _MK_MEM[ev["event_id"]] = (time.time(), d)
+    d = {"markets": event_markets(ev["event_id"])}
     main, rows = set(MAIN_IDS.split(",")), []
     for m in d.get("markets") or []:
         if m.get("status") != 0: continue
