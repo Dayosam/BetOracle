@@ -11,7 +11,7 @@ How a request works (built to use as few API calls as possible):
    and you get the code right away.
 
 Markets: GG, Over 1.5, Over 2.5, 2UP (replaces straight win), 1UP (+ Over 2.5 form),
-double chance, or "best picks" which mixes them (with at most GG_MAX_AUTO GG pick).
+double chance, or "best picks" which mixes them (GG kept to a small share).
 """
 
 import os
@@ -48,13 +48,14 @@ from cache import count_call
 load_dotenv()
 
 MAX_ANALYSE = int(os.getenv("MAX_ANALYSE", "48"))        # most matches whose form is checked per request
-BATCH = int(os.getenv("BATCH", "8"))                     # matches checked per round (it stops once it has enough)
+BATCH = int(os.getenv("BATCH", "12"))                     # matches checked per round (it stops once it has enough)
 TOTAL_BUDGET = float(os.getenv("TOTAL_BUDGET", "80"))    # seconds for the whole request
 FORM_BUDGET = float(os.getenv("FORM_BUDGET", "30"))      # seconds allowed for loading team stats
 EVENTS_BUDGET = float(os.getenv("EVENTS_BUDGET", "50"))  # seconds allowed for SportyBet's match list
 MARKET_BUDGET = float(os.getenv("MARKET_BUDGET", "20"))  # seconds allowed for extra SportyBet lookups
-GG_MAX_AUTO = int(os.getenv("GG_MAX_AUTO", "1"))         # most GG picks in a "best picks" (mixed) ticket
-UP_MIN_ODDS = float(os.getenv("UP_MIN_ODDS", "1.10"))    # 1UP / 2UP odds below this are not used
+GG_MAX_SHARE = float(os.getenv("GG_MAX_SHARE", "0.25"))   # GG may be at most this share of a mixed ticket (min 1)
+MIN_ODDS = float(os.getenv("MIN_ODDS", "1.20"))          # no pick with odds below this is ever used
+UP_MIN_ODDS = float(os.getenv("UP_MIN_ODDS", str(MIN_ODDS)))    # 1UP / 2UP odds below this are not used
 FORM_N = 10                                              # last N finished matches per team
 MIN_FORM = 6                                             # need at least this many matches of data
 
@@ -174,14 +175,19 @@ COUNTRY_SPECIAL = {
 
 def flag_for(country):
     n = unicodedata.normalize("NFKD", str(country or "")).encode("ascii", "ignore").decode().lower().strip()
+    words = n.split()
 
-    if n in COUNTRY_SPECIAL:
-        return COUNTRY_SPECIAL[n]
+    # "England Amateur" -> England, "Italy Women" -> Italy ...
+    for i in range(len(words), 0, -1):
+        part = " ".join(words[:i])
 
-    iso = COUNTRY_ISO.get(n)
+        if part in COUNTRY_SPECIAL:
+            return COUNTRY_SPECIAL[part]
 
-    if iso:
-        return "".join(chr(0x1F1E6 + ord(c) - 65) for c in iso)
+        iso = COUNTRY_ISO.get(part)
+
+        if iso:
+            return "".join(chr(0x1F1E6 + ord(c) - 65) for c in iso)
 
     return "\U0001F30D"      # globe for international / unknown
 
@@ -267,7 +273,19 @@ def parse_market(t):
         return "over25"
     if re.search(r"\bover\s*1\.?5\b|\bo1\.?5\b", t):
         return "over15"
-    if re.search(r"\b(double chance|dc|1x|x2|home or draw|draw or away)\b", t):
+    if re.search(r"\bunder\s*3\.?5\b|\bu3\.?5\b", t):
+        return "under35"
+    if re.search(r"\b(team to score|teams to score|home to score|away to score)\b", t):
+        return "ts"
+    if re.search(r"\beither half\b", t):
+        return "eh"
+    if re.search(r"\bhome or draw\b|\b1x\b", t):
+        return "dc1x"
+    if re.search(r"\bdraw or away\b|\bx2\b", t):
+        return "dcx2"
+    if re.search(r"\bhome or away\b|\bno draw\b", t):
+        return "dc12"
+    if re.search(r"\b(double chance|dc)\b", t):
         return "dc"
     if re.search(r"\b(straight wins?|win only|wins only|home win|away win|match winner|1x2|to win|winners?)\b", t):
         return "win"
@@ -477,6 +495,7 @@ def team_form(f, side):
     bt = sum(1 for gf, ga, _ in rows if gf > 0 and ga > 0)
     o15 = sum(1 for gf, ga, _ in rows if gf + ga >= 2)
     o25 = sum(1 for gf, ga, _ in rows if gf + ga >= 3)
+    o35 = sum(1 for gf, ga, _ in rows if gf + ga >= 4)
 
     def wdl(sub):
         w = sum(1 for gf, ga, _ in sub if gf > ga)
@@ -486,7 +505,7 @@ def team_form(f, side):
     return {
         "n": n, "sc": sc, "co": co, "bt": bt, "o15c": o15, "o25c": o25,
         "scored": sc / n, "conceded": co / n, "btts": bt / n,
-        "o15": o15 / n, "o25": o25 / n,
+        "o15": o15 / n, "o25": o25 / n, "o35c": o35, "o35": o35 / n,
         "all": wdl(rows),
         "H": wdl([r for r in rows if r[2] == "H"]),
         "A": wdl([r for r in rows if r[2] == "A"]),
@@ -511,7 +530,7 @@ def load_forms(fixtures, budget=None):
             print("FORM ERROR:", f.get(f"{side}_team"), type(e).__name__, e, flush=True)
             return tid, None
 
-    ex = ThreadPoolExecutor(max_workers=8)
+    ex = ThreadPoolExecutor(max_workers=16)
     futs = [ex.submit(work, item) for item in tasks.items()]
 
     done, pending = wait(futs, timeout=budget or FORM_BUDGET)
@@ -568,6 +587,30 @@ MARKETS = {
         "label": "Away 1UP (with Over 2.5 form)", "show": "Away 1UP",
         "market": "1X2 - 1UP", "pick": "Away",
     },
+    "eh_home": {
+        "label": "Home to win either half", "show": "Home to win either half",
+        "market": "Win Either Half", "pick": "Home",
+    },
+    "eh_away": {
+        "label": "Away to win either half", "show": "Away to win either half",
+        "market": "Win Either Half", "pick": "Away",
+    },
+    "dc_12": {
+        "label": "Home or away (no draw)", "show": "Home or Away",
+        "market": "Double Chance", "pick": "Home or Away", "search": "Double Chance",
+    },
+    "under35": {
+        "label": "Under 3.5 goals", "show": "Under 3.5 Goals",
+        "market": "Over/Under 3.5", "pick": "Under 3.5",
+    },
+    "ts_home": {
+        "label": "Home team to score", "show": "Home to score",
+        "market": "Home Team Goals 0.5", "pick": "Home Over 0.5",
+    },
+    "ts_away": {
+        "label": "Away team to score", "show": "Away to score",
+        "market": "Away Team Goals 0.5", "pick": "Away Over 0.5",
+    },
     "dc_1x": {
         "label": "Home or draw", "show": "Home or Draw",
         "market": "Double Chance", "pick": "Home or Draw", "search": "Double Chance",
@@ -586,13 +629,22 @@ GROUPS = {
     "win": ["win_home", "win_away"],
     "up1": ["up1_home", "up1_away"],
     "dc": ["dc_1x", "dc_x2"],
-    "auto": ["gg", "over25", "over15", "up1_home", "up1_away",
-             "win_home", "win_away", "dc_1x", "dc_x2"],
+    "under35": ["under35"],
+    "ts": ["ts_home", "ts_away"],
+    "eh": ["eh_home", "eh_away"],
+    "dc1x": ["dc_1x"],
+    "dcx2": ["dc_x2"],
+    "dc12": ["dc_12"],
+    "auto": ["gg", "over25", "over15", "under35", "up1_home", "up1_away",
+             "win_home", "win_away", "dc_1x", "dc_x2", "dc_12", "ts_home", "ts_away",
+             "eh_home", "eh_away"],
 }
 
 TITLES = {
     "gg": "GG ticket", "over25": "Over 2.5 ticket", "over15": "Over 1.5 ticket",
     "win": "2UP ticket", "up1": "1UP ticket", "dc": "Double chance ticket",
+    "under35": "Under 3.5 ticket", "ts": "Team to score ticket", "eh": "Win either half ticket",
+    "dc1x": "Home or draw ticket", "dcx2": "Draw or away ticket", "dc12": "Home or away ticket",
     "auto": "Best picks ticket",
 }
 
@@ -604,6 +656,22 @@ UP_KEYS = {
     "win_home": (2, "home"), "win_away": (2, "away"),
     "up1_home": (1, "home"), "up1_away": (1, "away"),
 }
+
+
+# markets that are not in SportyBet's match list: they are read from the event page when the ticket is built
+PAGE_KEYS = {"under35", "ts_home", "ts_away", "eh_home", "eh_away"}
+
+# win either half: key -> side
+EH_KEYS = {"eh_home": "home", "eh_away": "away"}
+
+# mixed tickets take picks family by family, so no single market (e.g. Over 2.5) dominates
+FAMILY = {
+    "gg": "gg", "over25": "o25", "over15": "o15", "under35": "u35",
+    "win_home": "win", "win_away": "win", "up1_home": "up1", "up1_away": "up1",
+    "dc_1x": "dc", "dc_x2": "dc", "dc_12": "dc", "ts_home": "ts", "ts_away": "ts",
+    "eh_home": "eh", "eh_away": "eh",
+}
+FAM_ORDER = ["win", "o25", "eh", "up1", "u35", "o15", "dc", "ts", "gg"]
 
 
 def venue_record(form, venue):
@@ -634,6 +702,39 @@ def score_market(key, h, a, loose=False, odds=None):
         score = (h["o15"] + a["o15"]) / 2
         thr = 0.80 - r
         ok = min(h["o15"], a["o15"]) >= 0.7 - r
+    elif key in ("eh_home", "eh_away"):
+        hr, _ = venue_record(h, "H")
+        ar, _ = venue_record(a, "A")
+        hn, an = max(hr["n"], 1), max(ar["n"], 1)
+
+        if key == "eh_home":
+            base = 0.5 * hr["w"] / hn + 0.5 * ar["l"] / an
+            side_ok = hr["w"] / hn >= 0.4 - r
+        else:
+            base = 0.5 * ar["w"] / an + 0.5 * hr["l"] / hn
+            side_ok = ar["w"] / an >= 0.4 - r
+
+        score = min(base + 0.10, 0.99)      # winning one half is easier than winning the match
+        thr = 0.60 - r
+        ok = side_ok
+    elif key == "dc_12":
+        dh = h["all"]["d"] / max(h["all"]["n"], 1)
+        da = a["all"]["d"] / max(a["all"]["n"], 1)
+        score = 1 - (dh + da) / 2
+        thr = 0.75 - r
+        ok = max(dh, da) <= 0.35 + r
+    elif key == "under35":
+        score = 1 - (h["o35"] + a["o35"]) / 2
+        thr = 0.75 - r
+        ok = max(h["o35"], a["o35"]) <= 0.35 + r
+    elif key == "ts_home":
+        score = (h["scored"] + a["conceded"]) / 2
+        thr = 0.85 - r
+        ok = h["scored"] >= 0.8 - r and a["conceded"] >= 0.6 - r
+    elif key == "ts_away":
+        score = (a["scored"] + h["conceded"]) / 2
+        thr = 0.85 - r
+        ok = a["scored"] >= 0.8 - r and h["conceded"] >= 0.6 - r
     elif key in ("up1_home", "up1_away"):
         hr, _ = venue_record(h, "H")
         ar, _ = venue_record(a, "A")
@@ -642,10 +743,10 @@ def score_market(key, h, a, loose=False, odds=None):
 
         if key == "up1_home":
             strength = 0.5 * hr["w"] / hn + 0.5 * ar["l"] / an
-            side_ok = hr["w"] / hn >= 0.4 - r and (odds is None or 1.10 <= odds <= 2.60)
+            side_ok = hr["w"] / hn >= 0.4 - r and (odds is None or MIN_ODDS <= odds <= 2.60)
         else:
             strength = 0.5 * ar["w"] / an + 0.5 * hr["l"] / hn
-            side_ok = ar["w"] / an >= 0.4 - r and (odds is None or 1.10 <= odds <= 2.90)
+            side_ok = ar["w"] / an >= 0.4 - r and (odds is None or MIN_ODDS <= odds <= 2.90)
 
         score = 0.6 * strength + 0.4 * o25avg
         thr = 0.55 - r
@@ -658,19 +759,19 @@ def score_market(key, h, a, loose=False, odds=None):
         if key == "win_home":
             score = 0.5 * hr["w"] / hn + 0.5 * ar["l"] / an
             thr = 0.60 - r
-            ok = hr["w"] / hn >= 0.5 - r and (odds is None or 1.20 <= odds <= 2.10)
+            ok = hr["w"] / hn >= 0.5 - r and (odds is None or MIN_ODDS <= odds <= 2.10)
         elif key == "win_away":
             score = 0.5 * ar["w"] / an + 0.5 * hr["l"] / hn
             thr = 0.60 - r
-            ok = ar["w"] / an >= 0.5 - r and (odds is None or 1.20 <= odds <= 2.40)
+            ok = ar["w"] / an >= 0.5 - r and (odds is None or MIN_ODDS <= odds <= 2.40)
         elif key == "dc_1x":
             score = 0.5 * (hr["w"] + hr["d"]) / hn + 0.5 * (ar["d"] + ar["l"]) / an
             thr = 0.80 - r
-            ok = (hr["w"] + hr["d"]) / hn >= 0.7 - r and (odds is None or odds >= 1.12)
+            ok = (hr["w"] + hr["d"]) / hn >= 0.7 - r and (odds is None or odds >= MIN_ODDS)
         else:  # dc_x2
             score = 0.5 * (ar["w"] + ar["d"]) / an + 0.5 * (hr["d"] + hr["l"]) / hn
             thr = 0.80 - r
-            ok = (ar["w"] + ar["d"]) / an >= 0.7 - r and (odds is None or odds >= 1.12)
+            ok = (ar["w"] + ar["d"]) / an >= 0.7 - r and (odds is None or odds >= MIN_ODDS)
 
     return {"score": score, "margin": score - thr, "strong": ok and score >= thr}
 
@@ -701,10 +802,46 @@ def reason_text(key, f, h, a):
             f"which supports Over 1.5."
         )
 
+    if key == "under35":
+        return (
+            f"{H} had 4+ goals in {h['o35c']}/{nh} of their last matches and {A} in "
+            f"{a['o35c']}/{na}. Neither side plays very open games, which supports Under 3.5."
+        )
+
+    if key == "ts_home":
+        return (
+            f"{H} scored in {h['sc']}/{nh} of their last matches and {A} conceded in "
+            f"{a['co']}/{na}, which supports {H} to score."
+        )
+
+    if key == "ts_away":
+        return (
+            f"{A} scored in {a['sc']}/{na} of their last matches and {H} conceded in "
+            f"{h['co']}/{nh}, which supports {A} to score."
+        )
+
     hr, hv = venue_record(h, "H")
     ar, av = venue_record(a, "A")
     hw = "home games" if hv else "games"
     aw = "away games" if av else "games"
+
+    if key == "eh_home":
+        return (
+            f"{H} won {hr['w']}/{hr['n']} of their last {hw}, while {A} lost {ar['l']}/{ar['n']} of "
+            f"their last {aw}. A stronger side usually wins at least one half, which supports {H} to win either half."
+        )
+
+    if key == "eh_away":
+        return (
+            f"{A} won {ar['w']}/{ar['n']} of their last {aw}, while {H} lost {hr['l']}/{hr['n']} of "
+            f"their last {hw}. A stronger side usually wins at least one half, which supports {A} to win either half."
+        )
+
+    if key == "dc_12":
+        return (
+            f"Draws are rare for both sides ({H} {h['all']['d']}/{h['all']['n']}, "
+            f"{A} {a['all']['d']}/{a['all']['n']} of their recent matches), which supports Home or Away."
+        )
 
     if key == "up1_home":
         return (
@@ -758,7 +895,7 @@ def evaluate(f, h, a, market, ev=None, loose=False):
 
         # when we know the SportyBet event, only use markets it actually lists
         # (1UP is checked against the plain 1X2 price, 2UP is booked from the event page later)
-        if ev is not None:
+        if ev is not None and k not in PAGE_KEYS:
             p = sportybet.market_pick(ev, BASE_KEY.get(k, k))
             if not p:
                 continue
@@ -774,6 +911,32 @@ def evaluate(f, h, a, market, ev=None, loose=False):
         return {"f": f, "h": h, "a": a, "ev": ev, **best}
 
     return None
+
+
+def evaluate_all(f, h, a, market, ev=None, loose=False):
+    """Every market that passes for this match (used by mixed tickets so they can be varied)."""
+
+    out = []
+
+    if not o15_ok(h, a, loose):
+        return out
+
+    for k in GROUPS[market]:
+        odds = None
+
+        if ev is not None and k not in PAGE_KEYS:
+            p = sportybet.market_pick(ev, BASE_KEY.get(k, k))
+            if not p:
+                continue
+            odds = p["odds"]
+
+        r = score_market(k, h, a, loose, odds)
+
+        if r["strong"]:
+            out.append({"f": f, "h": h, "a": a, "ev": ev, **r, "key": k, "odds_est": odds})
+
+    out.sort(key=lambda c: -c["margin"])
+    return out
 
 
 # =========================================================
@@ -951,7 +1114,7 @@ def resolve_pick(c, allow_up_lookup=True):
             return {"ref": p["ref"], "odds": p["odds"], "market": p["market"],
                     "pick": p["pick"], "show": f"{team} {n}UP"}, ""
 
-        if n == 2:
+        if n == 2 and "below" not in why:
             # 2UP not usable: fall back to the plain win so the match is not lost
             sp = sportybet.market_pick(ev, key)
             if sp:
@@ -959,6 +1122,41 @@ def resolve_pick(c, allow_up_lookup=True):
                         "pick": sp["pick"], "show": f"{team} to win (2UP unavailable)"}, ""
 
         return None, why
+
+    if key in EH_KEYS:
+        side = EH_KEYS[key]
+        team = f["home_team"] if side == "home" else f["away_team"]
+
+        try:
+            p, why = sportybet.either_half_lookup(ev, side, MIN_ODDS)
+        except Exception as e:
+            p, why = None, f"win either half lookup failed ({type(e).__name__})"
+            print("EH LOOKUP ERROR:", f["home_team"], "v", f["away_team"], type(e).__name__, e, flush=True)
+
+        if p:
+            return {"ref": p["ref"], "odds": p["odds"], "market": p["market"],
+                    "pick": p["pick"], "show": f"{team} to win either half"}, ""
+
+        return None, why
+
+    if key in PAGE_KEYS:
+        try:
+            p = sportybet.market_pick_any(ev, key)
+        except Exception as e:
+            p = None
+            print("PAGE LOOKUP ERROR:", f["home_team"], "v", f["away_team"], type(e).__name__, e, flush=True)
+
+        show = spec["show"]
+        if key == "ts_home":
+            show = f"{f['home_team']} to score"
+        elif key == "ts_away":
+            show = f"{f['away_team']} to score"
+
+        if p:
+            return {"ref": p["ref"], "odds": p["odds"], "market": p["market"],
+                    "pick": p["pick"], "show": show}, ""
+
+        return None, f"{spec['label']} is not offered on SportyBet for this match"
 
     p = sportybet.market_pick(ev, key)
 
@@ -974,7 +1172,7 @@ def warm_up_pages(cands, limit=16):
 
     ids = []
     for c in cands:
-        if c["key"] in UP_KEYS and c["ev"]["event_id"] not in ids:
+        if (c["key"] in UP_KEYS or c["key"] in PAGE_KEYS) and c["ev"]["event_id"] not in ids:
             ids.append(c["ev"]["event_id"])
         if len(ids) >= limit:
             break
@@ -1119,12 +1317,18 @@ def rank_events(evs, market, limit):
 
 
 def enough(cands, count, target):
+    by_event = {}
+
+    for c in cands:
+        by_event.setdefault(c["ev"]["event_id"], c.get("odds_est") or 1.5)
+
     if count:
-        return len(cands) >= count + 2
-    if not cands:
+        return len(by_event) >= count + 2
+
+    if not by_event:
         return False
-    odds = [c.get("odds_est") or 1.5 for c in cands]
-    return math.prod(odds) >= target
+
+    return math.prod(by_event.values()) >= target
 
 
 def display_fixture(ev):
@@ -1166,6 +1370,21 @@ def build_ticket(t, s):
     pseudo = [{"league_name": e["league"], "_ev": e} for e in evs]
     pseudo, league_label = pick_leagues(t, pseudo)
     evs = [p["_ev"] for p in pseudo]
+
+    # matches already sent earlier in this chat are skipped, so every ticket is different
+    sent = s.setdefault("sent", set())
+    excluded_n = 0
+
+    if not re.search(r"\b(same|again|repeat)\b", t):
+        before = len(evs)
+        evs = [e for e in evs if e["event_id"] not in sent]
+        excluded_n = before - len(evs)
+
+    if not evs and excluded_n:
+        return (
+            f"I already sent you all {excluded_n} matches I can check for {when}. "
+            f"Say \"reset matches\" if you want to use them again."
+        )
 
     if not evs:
         return (
@@ -1230,9 +1449,13 @@ def build_ticket(t, s):
                 continue
             checked += 1
             checked_pairs.append((ev, h, a))
-            c = evaluate(display_fixture(ev), h, a, market, ev, loose)
-            if c:
-                cands.append(c)
+
+            if market == "auto":
+                cands.extend(evaluate_all(display_fixture(ev), h, a, market, ev, loose))
+            else:
+                c = evaluate(display_fixture(ev), h, a, market, ev, loose)
+                if c:
+                    cands.append(c)
 
         if enough(cands, count, target):
             break
@@ -1250,51 +1473,90 @@ def build_ticket(t, s):
             return True
         return False
 
+    def try_add(c, relaxed):
+        """Try to put one candidate on the ticket. True if it was added."""
+
+        eid = c["ev"]["event_id"]
+
+        if eid in used:
+            return False
+
+        # GG must not be too much in a mixed ticket: at most GG_MAX_SHARE of the legs (always room for 1)
+        if market == "auto" and c["key"] == "gg" and state["gg"] >= max(1, int((len(legs) + 1) * GG_MAX_SHARE)):
+            return False
+
+        # stop the SportyBet lookups if the request is running out of time
+        if time.time() - t0 > TOTAL_BUDGET + 25:
+            return False
+
+        f = c["f"]
+        name = f"{f['home_team']} vs {f['away_team']}"
+        needs_page = c["key"] in UP_KEYS or c["key"] in PAGE_KEYS
+        is_up = c["key"] in UP_KEYS
+
+        pick, why = resolve_pick(c, allow_up_lookup=(state["up"] > 0))
+
+        if needs_page and state["up"] > 0:
+            state["up"] -= 1
+
+        if pick and pick["odds"] < MIN_ODDS:
+            skipped.append(f"{name}: odds {pick['odds']:.2f} are below {MIN_ODDS:g}")
+            return False
+
+        leg = make_leg(c, pick) if pick else None
+
+        if not leg and not needs_page and state["fb"] > 0:
+            state["fb"] -= 1
+            _, leg, why = lookup_leg(c)
+
+            if leg and leg["odds"] < MIN_ODDS:
+                skipped.append(f"{name}: odds {leg['odds']:.2f} are below {MIN_ODDS:g}")
+                return False
+
+        if not leg:
+            skipped.append(f"{name}: {why}")
+            return False
+
+        leg["relaxed"] = relaxed
+        legs.append(leg)
+        used.add(eid)
+
+        if c["key"] == "gg":
+            state["gg"] += 1
+
+        return True
+
     def fill(cand_list, relaxed):
         warm_up_pages(cand_list)
 
+        if market != "auto":
+            for c in cand_list:
+                if done():
+                    break
+                try_add(c, relaxed)
+            return
+
+        # mixed ticket: take one pick from each market family in turn
+        fams = {}
         for c in cand_list:
-            if done():
-                break
+            fams.setdefault(FAMILY[c["key"]], []).append(c)
 
-            eid = c["ev"]["event_id"]
+        order = [f for f in FAM_ORDER if f in fams]
+        progress = True
 
-            if eid in used:
-                continue
+        while progress and not done():
+            progress = False
 
-            # a mixed ticket carries at most GG_MAX_AUTO GG pick
-            if market == "auto" and c["key"] == "gg" and state["gg"] >= GG_MAX_AUTO:
-                continue
+            for fam in order:
+                if done():
+                    break
 
-            # stop the SportyBet lookups if the request is running out of time
-            if time.time() - t0 > TOTAL_BUDGET + 25:
-                break
+                lst = fams[fam]
 
-            f = c["f"]
-            name = f"{f['home_team']} vs {f['away_team']}"
-            is_up = c["key"] in UP_KEYS
-
-            pick, why = resolve_pick(c, allow_up_lookup=(state["up"] > 0))
-
-            if is_up and state["up"] > 0:
-                state["up"] -= 1
-
-            leg = make_leg(c, pick) if pick else None
-
-            if not leg and not is_up and state["fb"] > 0:
-                state["fb"] -= 1
-                _, leg, why = lookup_leg(c)
-
-            if not leg:
-                skipped.append(f"{name}: {why}")
-                continue
-
-            leg["relaxed"] = relaxed
-            legs.append(leg)
-            used.add(eid)
-
-            if c["key"] == "gg":
-                state["gg"] += 1
+                while lst:
+                    if try_add(lst.pop(0), relaxed):
+                        progress = True
+                        break
 
     fill(cands, loose)
 
@@ -1307,9 +1569,13 @@ def build_ticket(t, s):
         for ev, h, a in checked_pairs:
             if ev["event_id"] in used:
                 continue
-            c = evaluate(display_fixture(ev), h, a, market, ev, True)
-            if c:
-                extra.append(c)
+
+            if market == "auto":
+                extra.extend(evaluate_all(display_fixture(ev), h, a, market, ev, True))
+            else:
+                c = evaluate(display_fixture(ev), h, a, market, ev, True)
+                if c:
+                    extra.append(c)
 
         extra.sort(key=lambda c: -c["margin"])
 
@@ -1327,6 +1593,8 @@ def build_ticket(t, s):
 
     s["ticket"][:] = legs
     s["slips"] = []
+    s["fresh"] = True
+    sent.update(used)
 
     # ---- 5. book it
     title = TITLES.get(market, "Ticket")
@@ -1362,6 +1630,12 @@ def build_ticket(t, s):
             f"so this ticket reaches {total} odds."
         )
 
+    if short and excluded_n:
+        notes.append(
+            f"{excluded_n} matches from your earlier tickets were left out so you get new ones. "
+            f"Say \"reset matches\" to use them again."
+        )
+
     if unfinished:
         notes.append(
             f"The stats server was slow, so {unfinished} teams were not checked in time. "
@@ -1381,6 +1655,55 @@ def build_ticket(t, s):
         reply += "\n\nSkipped:\n" + "\n".join(skipped[:5])
 
     return reply
+
+
+WARM_PREFETCH = os.getenv("WARM_PREFETCH", "0") == "1"
+WARM_MAX = int(os.getenv("WARM_MAX", "60"))
+WARM_EVERY = int(os.getenv("WARM_EVERY", "3600"))
+
+
+def warm_forms_once():
+    """Load team form for today's and tomorrow's matches ahead of time, so tickets build fast."""
+
+    d1 = today()
+
+    for d in (d1, d1 + timedelta(days=1)):
+        evs = sb_window_events(d, d)
+
+        if not evs:
+            continue
+
+        ranked = rank_events(evs, "auto", 1000)
+
+        try:
+            fixtures = sa_fixtures(d)
+        except Exception as e:
+            print("WARM fixtures error:", e, flush=True)
+            continue
+
+        pairs = []
+        for ev in ranked:
+            fx = match_fixture(ev, fixtures)
+            if fx:
+                pairs.append(fx)
+
+        pairs = pairs[:WARM_MAX]
+
+        for i in range(0, len(pairs), 12):
+            load_forms(pairs[i:i + 12], 60)
+
+        print(f"WARM: {len(pairs)} matches loaded for {d}", flush=True)
+
+
+def warm_loop():
+    time.sleep(90)          # let SportyBet's match list load first
+
+    while True:
+        try:
+            warm_forms_once()
+        except Exception as e:
+            print("WARM ERROR:", type(e).__name__, e, flush=True)
+        time.sleep(WARM_EVERY)
 
 
 def stats_only(t, d_from, d_to, when, market, count, k, why):
@@ -1534,6 +1857,8 @@ def do_book(s):
     except Exception as e:
         return f"SportyBet booking failed: {type(e).__name__}: {e}"
 
+    s["fresh"] = True
+
     return f"📋 Code: [[code:{item['code']}]] — {item['games']} games, {item['odds']} odds."
 
 
@@ -1580,6 +1905,7 @@ def help_text(lead=""):
         "• 5 1UP matches tomorrow (home or away goes 1 up, with Over 2.5 form)\n"
         "• Give me 10 matches that can play GG from today's European competitions\n"
         "• Double chance 5 matches tomorrow\n"
+        "• Under 3.5, team to score, win either half, home or draw, draw or away\n"
         "• Over 2.5 picks for the weekend\n"
         "• Give me your best 10 odds (mixes every market I know, at most 1 GG)\n"
         "• Add \"risky\" to relax the stats check\n"
@@ -1587,7 +1913,9 @@ def help_text(lead=""):
         "• Paste a booking code to read it, or: convert this to Bet9ja\n"
         "• remove leg 3 / remove odds below 1.2 / book this ticket\n\n"
         "Every pick also has to pass an Over 1.5 check.\n"
-        "Markets I can build from stats right now: 2UP, 1UP, GG, Over 1.5, Over 2.5, double chance.\n"
+        "Markets I can build from stats right now: 2UP, 1UP, GG, Over 1.5, Over 2.5, Under 3.5, team to score, win either half, double chance.\n"
+        "No pick with odds below 1.20 is ever used.\n"
+        "Every new ticket uses different matches from the ones I already sent (say \"reset matches\" to start over).\n"
         f"Bookmakers: {names}"
     )
 
@@ -1617,6 +1945,11 @@ def handle(msg, s):
         if s["codes"]:
             return do_convert(s["codes"][-1]["code"], bk, s)
         return "Paste the booking code you want to convert, or ask me for a ticket first."
+
+    # 3a. forget the matches already sent
+    if re.search(r"\b(reset|forget|clear)\s+(the\s+|my\s+)?(matches|history)\b", t):
+        s.setdefault("sent", set()).clear()
+        return "Done. I will use any match again, including the ones I already sent."
 
     # 3. clear
     if re.search(r"\b(clear|reset|empty|start over)\b", t):
@@ -1674,13 +2007,16 @@ def preload_sportybet():
 
     threading.Thread(target=go, daemon=True).start()
 
+    if WARM_PREFETCH:
+        threading.Thread(target=warm_loop, daemon=True).start()
+
 
 @app.post("/api/chat")
 def chat(c: Chat):
 
     s = SESSIONS.setdefault(
         c.session,
-        {"ticket": [], "slips": [], "codes": []}
+        {"ticket": [], "slips": [], "codes": [], "sent": set()}
     )
 
     try:
@@ -1693,7 +2029,8 @@ def chat(c: Chat):
     return {
         "reply": reply,
         "ticket": s["ticket"],
-        "codes": s["codes"]
+        "codes": s["codes"],
+        "fresh": s.pop("fresh", False)
     }
 
 
