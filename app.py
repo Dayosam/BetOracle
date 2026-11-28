@@ -4,9 +4,14 @@ BetOracle: no AI, no Groq.
 How a request works (built to use as few API calls as possible):
 1. SportyBet's own match list (one cached download, with GG / Over odds included) is
    filtered by day and league and ranked by those odds. This costs ZERO SportAPI calls.
-2. Only the best ~16 matches get their form checked on SportAPI (2 calls per match,
-   remembered in memory, including failed lookups).
-3. Matches that pass the form check are booked on SportyBet and you get the code.
+2. Only the best matches get their form checked on SportAPI (2 calls per match,
+   remembered in memory, including failed lookups). If SportAPI's daily limit is reached,
+   sportapi.py switches to goal-api.com automatically.
+3. Matches that pass the form check (and the Over 1.5 check) are booked on SportyBet
+   and you get the code right away.
+
+Markets: GG, Over 1.5, Over 2.5, 2UP (replaces straight win), 1UP (+ Over 2.5 form),
+double chance, or "best picks" which mixes them (with at most GG_MAX_AUTO GG pick).
 """
 
 import os
@@ -47,6 +52,8 @@ TOTAL_BUDGET = float(os.getenv("TOTAL_BUDGET", "80"))    # seconds for the whole
 FORM_BUDGET = float(os.getenv("FORM_BUDGET", "30"))      # seconds allowed for loading team stats
 EVENTS_BUDGET = float(os.getenv("EVENTS_BUDGET", "50"))  # seconds allowed for SportyBet's match list
 MARKET_BUDGET = float(os.getenv("MARKET_BUDGET", "20"))  # seconds allowed for extra SportyBet lookups
+GG_MAX_AUTO = int(os.getenv("GG_MAX_AUTO", "1"))         # most GG picks in a "best picks" (mixed) ticket
+UP_MIN_ODDS = float(os.getenv("UP_MIN_ODDS", "1.20"))    # 1UP / 2UP odds below this are not used
 FORM_N = 10                                              # last N finished matches per team
 MIN_FORM = 6                                             # need at least this many matches of data
 
@@ -180,6 +187,11 @@ def parse_dates(t):
 
 
 def parse_market(t):
+    # 1UP / 2UP first, so "1up over 2.5" is not read as a plain Over 2.5 request
+    if re.search(r"\b1-?up\b|\bone-?up\b", t):
+        return "up1"
+    if re.search(r"\b2-?up\b|\btwo-?up\b", t):
+        return "win"                      # 2UP replaces the straight win
     if re.search(r"\b(gg|btts|bts|both teams|both team)\b", t):
         return "gg"
     if re.search(r"\bover\s*2\.?5\b|\bo2\.?5\b", t):
@@ -470,13 +482,22 @@ MARKETS = {
         "market": "Over/Under 1.5", "pick": "Over 1.5",
         "search": "Over/Under,Total",
     },
+    # straight win is now booked as 2UP (falls back to the plain win if SportyBet has no 2UP)
     "win_home": {
-        "label": "Home win", "show": "Home Win",
-        "market": "1X2", "pick": "Home", "search": "1X2",
+        "label": "Home 2UP (win)", "show": "Home 2UP",
+        "market": "1X2 - 2UP", "pick": "Home", "search": "1X2",
     },
     "win_away": {
-        "label": "Away win", "show": "Away Win",
-        "market": "1X2", "pick": "Away", "search": "1X2",
+        "label": "Away 2UP (win)", "show": "Away 2UP",
+        "market": "1X2 - 2UP", "pick": "Away", "search": "1X2",
+    },
+    "up1_home": {
+        "label": "Home 1UP (with Over 2.5 form)", "show": "Home 1UP",
+        "market": "1X2 - 1UP", "pick": "Home",
+    },
+    "up1_away": {
+        "label": "Away 1UP (with Over 2.5 form)", "show": "Away 1UP",
+        "market": "1X2 - 1UP", "pick": "Away",
     },
     "dc_1x": {
         "label": "Home or draw", "show": "Home or Draw",
@@ -494,13 +515,25 @@ GROUPS = {
     "over25": ["over25"],
     "over15": ["over15"],
     "win": ["win_home", "win_away"],
+    "up1": ["up1_home", "up1_away"],
     "dc": ["dc_1x", "dc_x2"],
-    "auto": ["gg", "over25", "over15", "win_home", "win_away", "dc_1x", "dc_x2"],
+    "auto": ["gg", "over25", "over15", "up1_home", "up1_away",
+             "win_home", "win_away", "dc_1x", "dc_x2"],
 }
 
 TITLES = {
     "gg": "GG ticket", "over25": "Over 2.5 ticket", "over15": "Over 1.5 ticket",
-    "win": "Straight win ticket", "dc": "Double chance ticket", "auto": "Best picks ticket",
+    "win": "2UP ticket", "up1": "1UP ticket", "dc": "Double chance ticket",
+    "auto": "Best picks ticket",
+}
+
+# 1UP has no price in SportyBet's match list, so its odds are checked against the plain 1X2 price
+BASE_KEY = {"up1_home": "win_home", "up1_away": "win_away"}
+
+# keys that are booked from the 1X2 - 1UP / 2UP markets: key -> (UP number, side)
+UP_KEYS = {
+    "win_home": (2, "home"), "win_away": (2, "away"),
+    "up1_home": (1, "home"), "up1_away": (1, "away"),
 }
 
 
@@ -508,6 +541,12 @@ def venue_record(form, venue):
     """Wins/draws/losses at home (H) or away (A); falls back to all matches if fewer than 3."""
     r = form[venue]
     return (r, True) if r["n"] >= 3 else (form["all"], False)
+
+
+def o15_ok(h, a, loose=False):
+    """Over 1.5 check that every prediction must pass."""
+    r = 0.1 if loose else 0.0
+    return min(h["o15"], a["o15"]) >= 0.6 - r and (h["o15"] + a["o15"]) / 2 >= 0.75 - r
 
 
 def score_market(key, h, a, loose=False, odds=None):
@@ -526,6 +565,22 @@ def score_market(key, h, a, loose=False, odds=None):
         score = (h["o15"] + a["o15"]) / 2
         thr = 0.80 - r
         ok = min(h["o15"], a["o15"]) >= 0.7 - r
+    elif key in ("up1_home", "up1_away"):
+        hr, _ = venue_record(h, "H")
+        ar, _ = venue_record(a, "A")
+        hn, an = max(hr["n"], 1), max(ar["n"], 1)
+        o25avg = (h["o25"] + a["o25"]) / 2
+
+        if key == "up1_home":
+            strength = 0.5 * hr["w"] / hn + 0.5 * ar["l"] / an
+            side_ok = hr["w"] / hn >= 0.4 - r and (odds is None or 1.10 <= odds <= 2.60)
+        else:
+            strength = 0.5 * ar["w"] / an + 0.5 * hr["l"] / hn
+            side_ok = ar["w"] / an >= 0.4 - r and (odds is None or 1.10 <= odds <= 2.90)
+
+        score = 0.6 * strength + 0.4 * o25avg
+        thr = 0.55 - r
+        ok = side_ok and min(h["o25"], a["o25"]) >= 0.4 - r and o25avg >= 0.5 - r
     else:
         hr, _ = venue_record(h, "H")      # home team's record at home
         ar, _ = venue_record(a, "A")      # away team's record away
@@ -582,18 +637,32 @@ def reason_text(key, f, h, a):
     hw = "home games" if hv else "games"
     aw = "away games" if av else "games"
 
+    if key == "up1_home":
+        return (
+            f"{H} won {hr['w']}/{hr['n']} of their last {hw}, while {A} lost "
+            f"{ar['l']}/{ar['n']} of their last {aw}. Matches also reach 3+ goals often "
+            f"({H} {h['o25c']}/{nh}, {A} {a['o25c']}/{na}), so {H} should take the lead at some point."
+        )
+
+    if key == "up1_away":
+        return (
+            f"{A} won {ar['w']}/{ar['n']} of their last {aw}, while {H} lost "
+            f"{hr['l']}/{hr['n']} of their last {hw}. Matches also reach 3+ goals often "
+            f"({H} {h['o25c']}/{nh}, {A} {a['o25c']}/{na}), so {A} should take the lead at some point."
+        )
+
     if key == "win_home":
         return (
             f"{H} won {hr['w']}/{hr['n']} of their last {hw} (D{hr['d']} L{hr['l']}), while {A} "
             f"lost {ar['l']}/{ar['n']} of their last {aw}. A strong host against a "
-            f"vulnerable visitor, which supports a {H} win."
+            f"vulnerable visitor, which supports {H} going two goals up."
         )
 
     if key == "win_away":
         return (
             f"{A} won {ar['w']}/{ar['n']} of their last {aw} (D{ar['d']} L{ar['l']}), while {H} "
             f"lost {hr['l']}/{hr['n']} of their last {hw}. A strong visitor against a "
-            f"weak host, which supports an {A} win."
+            f"weak host, which supports {A} going two goals up."
         )
 
     if key == "dc_1x":
@@ -619,8 +688,9 @@ def evaluate(f, h, a, market, ev=None, loose=False):
         odds = None
 
         # when we know the SportyBet event, only use markets it actually lists
+        # (1UP is checked against the plain 1X2 price, 2UP is booked from the event page later)
         if ev is not None:
-            p = sportybet.market_pick(ev, k)
+            p = sportybet.market_pick(ev, BASE_KEY.get(k, k))
             if not p:
                 continue
             odds = p["odds"]
@@ -628,9 +698,10 @@ def evaluate(f, h, a, market, ev=None, loose=False):
         r = score_market(k, h, a, loose, odds)
 
         if best is None or r["margin"] > best["margin"]:
-            best = {**r, "key": k}
+            best = {**r, "key": k, "odds_est": odds}
 
-    if best and best["strong"]:
+    # every prediction must also pass the Over 1.5 check
+    if best and best["strong"] and o15_ok(h, a, loose):
         return {"f": f, "h": h, "a": a, "ev": ev, **best}
 
     return None
@@ -708,6 +779,9 @@ def lookup_leg(c):
     f = c["f"]
     spec = MARKETS[c["key"]]
 
+    if c["key"] not in ("gg", "over25", "over15"):
+        return c, None, "market not listed on SportyBet"
+
     try:
         data = sportybet.get_markets(
             "football", f["home_team"], f["away_team"], spec["search"]
@@ -726,28 +800,98 @@ def lookup_leg(c):
     except Exception:
         return c, None, "odds missing"
 
-    return c, make_leg(c, sel["ref"], odds), ""
+    return c, make_leg(c, {
+        "ref": sel["ref"], "odds": odds,
+        "market": spec["market"], "pick": spec["pick"], "show": spec["show"],
+    }), ""
 
 
-def make_leg(c, ref, odds):
+def extra_notes(c):
+    """Text added to every pick: the Over 1.5 check, and the 2UP angle on a GG pick."""
+
+    f, h, a = c["f"], c["h"], c["a"]
+    parts = []
+
+    if c["key"] != "over15":
+        parts.append(
+            f"Over 1.5 check passed: {f['home_team']} {h['o15c']}/{h['n']}, "
+            f"{f['away_team']} {a['o15c']}/{a['n']} games with 2+ goals."
+        )
+
+    if c["key"] == "gg":
+        best = None
+        for k in ("win_home", "win_away"):
+            r = score_market(k, h, a, False, None)
+            if r["strong"] and (best is None or r["margin"] > best[1]["margin"]):
+                best = (k, r)
+        if best:
+            team = f["home_team"] if best[0] == "win_home" else f["away_team"]
+            parts.append(f"2UP angle: {team} is also strong enough for a 2UP.")
+
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def make_leg(c, pick):
+    """pick = {"ref", "odds", "market", "pick", "show"}"""
+
     f = c["f"]
-    spec = MARKETS[c["key"]]
 
     return {
         "home": f["home_team"],
         "away": f["away_team"],
         "kickoff": f.get("kickoff_utc", ""),
         "sport": "football",
-        "ref": ref,
-        "market": spec["market"],
-        "pick": spec["pick"],
-        "show": spec["show"],
-        "odds": odds,
-        "reason": reason_text(c["key"], f, c["h"], c["a"]),
+        "ref": pick["ref"],
+        "market": pick["market"],
+        "pick": pick["pick"],
+        "show": pick["show"],
+        "odds": pick["odds"],
+        "reason": reason_text(c["key"], f, c["h"], c["a"]) + extra_notes(c),
         "league": f.get("league_name", ""),
         "kickoff_label": kick_time(f),
         "kickoff_short": kick_short(f),
     }
+
+
+def resolve_pick(c, allow_up_lookup=True):
+    """Find the SportyBet selection (ref + odds) for a candidate.
+    1UP / 2UP come from the event page; everything else from the match list.
+    Returns None if SportyBet does not offer it."""
+
+    key, ev, f = c["key"], c["ev"], c["f"]
+    spec = MARKETS[key]
+
+    if key in UP_KEYS:
+        n, side = UP_KEYS[key]
+        team = f["home_team"] if side == "home" else f["away_team"]
+
+        p = None
+        if allow_up_lookup:
+            try:
+                p = sportybet.up_pick(ev, n, side, UP_MIN_ODDS)
+            except Exception as e:
+                print("UP LOOKUP ERROR:", f["home_team"], "v", f["away_team"], type(e).__name__, e, flush=True)
+
+        if p:
+            return {"ref": p["ref"], "odds": p["odds"], "market": p["market"],
+                    "pick": p["pick"], "show": f"{team} {n}UP"}
+
+        if n == 2:
+            # 2UP not listed or too low: fall back to the plain win so the match is not lost
+            s = sportybet.market_pick(ev, key)
+            if s:
+                return {"ref": s["ref"], "odds": s["odds"], "market": s["market"],
+                        "pick": s["pick"], "show": f"{team} to win (no 2UP listed)"}
+
+        return None
+
+    p = sportybet.market_pick(ev, key)
+
+    if p:
+        return {"ref": p["ref"], "odds": p["odds"], "market": p["market"],
+                "pick": p["pick"], "show": spec["show"]}
+
+    return None
 
 
 def warm_sportybet():
@@ -850,7 +994,11 @@ def rank_events(evs, market, limit):
     """Order the events by how promising SportyBet's own odds make them (no SportAPI calls)."""
 
     def lowest(ev, group):
-        odds = [p["odds"] for p in (sportybet.market_pick(ev, k) for k in GROUPS[group]) if p]
+        odds = [
+            p["odds"]
+            for p in (sportybet.market_pick(ev, BASE_KEY.get(k, k)) for k in GROUPS[group])
+            if p
+        ]
         return min(odds) if odds else None
 
     def proxy(ev, group):
@@ -860,7 +1008,7 @@ def rank_events(evs, market, limit):
         o25 = lowest(ev, "over25")           # high-scoring games are good for GG and Over 1.5 too
         return (o25 + 0.3) if o25 and group in ("gg", "over15") else 99
 
-    groups = ["gg", "over25", "win"] if market == "auto" else [market]
+    groups = ["gg", "over25", "win", "up1"] if market == "auto" else [market]
     lists = [sorted(evs, key=lambda e, g=group: proxy(e, g)) for group in groups]
 
     out, seen = [], set()
@@ -881,7 +1029,7 @@ def enough(cands, count, target):
         return len(cands) >= count + 2
     if not cands:
         return False
-    odds = [sportybet.market_pick(c["ev"], c["key"])["odds"] for c in cands]
+    odds = [c.get("odds_est") or 1.5 for c in cands]
     return math.prod(odds) >= target
 
 
@@ -942,7 +1090,7 @@ def build_ticket(t, s):
             fixtures += sa_fixtures(d)
         except Exception as e:
             if "limit" in str(e).lower():
-                return f"SportAPI daily limit reached. It resets at 00:00 UTC. ({e})"
+                return f"Both stats APIs have reached their daily limit. It resets at 00:00 UTC. ({e})"
             print("FIXTURES ERROR:", d, e, flush=True)
 
     # keep only matches the stats provider knows (free: no API calls), still in ranked order
@@ -996,13 +1144,16 @@ def build_ticket(t, s):
         return (
             f"I checked the form of {checked} {league_label} matches for {when} "
             f"({total_found} on SportyBet; {no_stats} covered matches had no usable form data), "
-            f"but none passed the stats check. I would rather give you nothing than weak picks. "
+            f"but none passed the stats check (including the Over 1.5 check). "
+            f"I would rather give you nothing than weak picks. "
             f"Say \"risky\" if you want me to relax the check."
         )
 
-    # ---- 4. build the ticket with the odds from SportyBet's list
+    # ---- 4. build the ticket with the odds from SportyBet
     legs, skipped = [], []
+    gg_n = 0
     fallback_left = (count or 8) + 3
+    up_lookups_left = (count or 8) + 6          # 1UP / 2UP need one SportyBet event page each
 
     for c in cands:
         if count and len(legs) >= count:
@@ -1010,10 +1161,29 @@ def build_ticket(t, s):
         if target and legs and prod(legs) >= target:
             break
 
-        pick = sportybet.market_pick(c["ev"], c["key"])
+        # a mixed ticket carries at most GG_MAX_AUTO GG pick
+        if market == "auto" and c["key"] == "gg" and gg_n >= GG_MAX_AUTO:
+            continue
+
+        # stop the SportyBet lookups if the request is running out of time
+        if time.time() - t0 > TOTAL_BUDGET + 25:
+            break
+
+        is_up = c["key"] in UP_KEYS
+        pick = resolve_pick(c, allow_up_lookup=(up_lookups_left > 0)) if is_up else resolve_pick(c)
+
+        if is_up and up_lookups_left > 0:
+            up_lookups_left -= 1
 
         if pick:
-            legs.append(make_leg(c, pick["ref"], pick["odds"]))
+            legs.append(make_leg(c, pick))
+            if c["key"] == "gg":
+                gg_n += 1
+            continue
+
+        if is_up:
+            f = c["f"]
+            skipped.append(f"{f['home_team']} vs {f['away_team']}: 1UP/2UP not offered on SportyBet")
             continue
 
         if fallback_left <= 0:
@@ -1024,6 +1194,8 @@ def build_ticket(t, s):
 
         if leg:
             legs.append(leg)
+            if c["key"] == "gg":
+                gg_n += 1
         else:
             f = c["f"]
             skipped.append(f"{f['home_team']} vs {f['away_team']}: {why}")
@@ -1086,7 +1258,7 @@ def build_ticket(t, s):
     reply = "\n\n".join(parts)
 
     if skipped:
-        reply += "\n\nSkipped (strong stats, but no usable market on SportyBet):\n" + "\n".join(skipped[:5])
+        reply += "\n\nSkipped:\n" + "\n".join(skipped[:5])
 
     scope = "" if league_label == "all leagues" else f"{league_label} "
 
@@ -1150,7 +1322,7 @@ def stats_only(t, d_from, d_to, when, market, count, k, why):
             f"{i}. {f['home_team']} vs {f['away_team']}\n"
             f"   {f.get('league_name', '')} · {kick_time(f)}\n"
             f"   Market: {MARKETS[c['key']]['label']}\n"
-            f"   {reason_text(c['key'], f, c['h'], c['a'])}"
+            f"   {reason_text(c['key'], f, c['h'], c['a'])}{extra_notes(c)}"
         )
 
     return (
@@ -1294,16 +1466,18 @@ def help_text(lead=""):
     return (
         (lead + "\n\n" if lead else "")
         + "I build tickets from real form stats and give you the booking code. Try:\n\n"
+        "• Give me 10 2UP matches today (2UP replaces straight win)\n"
+        "• 5 1UP matches tomorrow (home or away goes 1 up, with Over 2.5 form)\n"
         "• Give me 10 matches that can play GG from today's European competitions\n"
-        "• Straight win 10 matches today\n"
         "• Double chance 5 matches tomorrow\n"
         "• Over 2.5 picks for the weekend\n"
-        "• Give me your best 10 odds (mixes every market I know)\n"
+        "• Give me your best 10 odds (mixes every market I know, at most 1 GG)\n"
         "• Add \"risky\" to relax the stats check\n"
         "• receipt (makes the shareable image of your ticket)\n"
         "• Paste a booking code to read it, or: convert this to Bet9ja\n"
         "• remove leg 3 / remove odds below 1.2 / book this ticket\n\n"
-        "Markets I can build from stats right now: GG, Over 1.5, Over 2.5, straight win, double chance.\n"
+        "Every pick also has to pass an Over 1.5 check.\n"
+        "Markets I can build from stats right now: 2UP, 1UP, GG, Over 1.5, Over 2.5, double chance.\n"
         f"Bookmakers: {names}"
     )
 
@@ -1422,6 +1596,31 @@ def debug_markets(home: str, away: str, search: str = ""):
     try:
         data = sportybet.get_markets("football", home, away, search or None)
         return {"seconds": round(time.time() - t0, 1), "type": type(data).__name__, "data": data}
+    except Exception as e:
+        return {"seconds": round(time.time() - t0, 1), "error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/debug-up")
+def debug_up(home: str, away: str, n: int = 2, side: str = "home"):
+    """Checks that 1UP / 2UP is found for a match. Example:
+    /api/debug-up?home=Arsenal&away=Chelsea&n=2&side=home"""
+
+    t0 = time.time()
+
+    try:
+        ev = sportybet._find("football", home, away)
+        names = sorted({
+            str(m.get("desc"))
+            for m in sportybet.event_markets(ev["event_id"])
+            if "up" in str(m.get("desc", "")).lower()
+        })
+        pick = sportybet.up_pick(ev, n, side, 0)
+        return {
+            "seconds": round(time.time() - t0, 1),
+            "event": f"{ev['home']} v {ev['away']}",
+            "markets_with_up_in_name": names,
+            "pick": pick,
+        }
     except Exception as e:
         return {"seconds": round(time.time() - t0, 1), "error": f"{type(e).__name__}: {e}"}
 
